@@ -3,6 +3,13 @@ DEBUG_MODE = False
 USE_CUDA = not DEBUG_MODE
 CUDA_DEVICE_NUM = 0
 
+# ==========================================
+# 设置确定性环境变量（必须在导入 torch 之前）
+# ==========================================
+import os
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+os.environ['PYTHONHASHSEED'] = '42'
+
 
 ##########################################################################################
 problems_size = 100
@@ -14,8 +21,10 @@ qkv_dim = embedding_dim // head_num
 ##########################################################################################
 # Path Config
 
-import os
 import sys
+import random
+import numpy as np
+import torch
  
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "..")  # for problem_def
@@ -29,6 +38,18 @@ import logging
 
 from utils.utils import create_logger, copy_all_src
 from ATSPTrainer import ATSPTrainer as Trainer
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # 设置 PyTorch 的确定性算法（warn_only=True 允许某些操作仍可运行）
+    torch.use_deterministic_algorithms(True, warn_only=True)
 ##########################################################################################
 # parameters
 
@@ -50,7 +71,7 @@ model_params = {
     'qkv_dim': qkv_dim,
     'sqrt_qkv_dim': qkv_dim**(1/2),
     'head_num': head_num,
-    'init': 'svd',
+    'init': 'zero',
     'att_type': 'normal',
     'logit_clipping': 10,
     'ff_hidden_dim': 512,
@@ -112,6 +133,11 @@ def main():
     if DEBUG_MODE:
         _set_debug_mode()
 
+    # 设置随机种子
+    SEED = 1234
+    set_seed(SEED)
+    print(f'Random seed set to: {SEED}')
+
     create_logger(**logger_params)
     _print_config()
 
@@ -120,7 +146,7 @@ def main():
                       optimizer_params=optimizer_params,
                       trainer_params=trainer_params)
 
-    copy_all_src(trainer.result_folder)
+    # copy_all_src(trainer.result_folder)
 
     trainer.run()
 

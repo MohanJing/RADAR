@@ -21,18 +21,29 @@ class ATSPModel(nn.Module):
 
     def pre_forward(self, reset_state):
         problems = reset_state.problems
+        init_method = self.model_params.get('init', 'svd')
+        
         mean_val = problems.mean(dim=(1, 2), keepdim=True)
         std_val = problems.std(dim=(1, 2), keepdim=True)
         problems = (problems - mean_val) / (std_val + 1e-9)
         
-        U, S, V = torch.svd_lowrank(problems, q=self.k)
-        sqrt_S = torch.sqrt(S)  # (batch, k)
+        if init_method == 'zero':
+            batch_size, n, _ = problems.shape
+            X = torch.zeros(batch_size, n, 2*self.k, device=problems.device, dtype=problems.dtype)
+            # final_embedding = torch.zeros(batch_size, n, self.embedding_dim, device=problems.device, dtype=problems.dtype)
+        elif init_method == 'svd':
+            U, S, V = torch.svd_lowrank(problems, q=self.k)
+            sqrt_S = torch.sqrt(S)  # (batch, k)
 
-        Q = U * sqrt_S.unsqueeze(1)  # (batch, n, k)
-        K = V * sqrt_S.unsqueeze(1)  # (batch, n, k)
+            Q = U * sqrt_S.unsqueeze(1)  # (batch, n, k)
+            K = V * sqrt_S.unsqueeze(1)  # (batch, n, k)
 
-        X = torch.cat([Q, K], dim=-1)  # (batch, n, 2*k)
-        
+            X = torch.cat([Q, K], dim=-1)  # (batch, n, 2*k)
+
+            # final_embedding = self.projection(X)
+        else:
+            raise ValueError(f"Unknown init method: {init_method}")
+
         final_embedding = self.projection(X)
         
         self.encoded_node = self.encoder(final_embedding, problems)
@@ -127,6 +138,9 @@ class EncodingBlock(nn.Module):
 
         self.Wq = nn.Linear(embedding_dim, head_num * qkv_dim, bias=True)
         self.Wk = nn.Linear(embedding_dim, head_num * qkv_dim, bias=True)
+        # 以下遵循MatNet的实现，Wq, Wk, Wv 都使用 bias=False
+        # self.Wq = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        # self.Wk = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
         self.Wv = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
 
         self.mixed_score_MHA = MixedScore_MultiHeadAttention(**model_params)
@@ -136,7 +150,7 @@ class EncodingBlock(nn.Module):
         self.feed_forward = FeedForward(**model_params)
         self.add_n_normalization_2 = AddAndInstanceNormalization(**model_params)
 
-        self.g_layer = nn.Linear(embedding_dim, embedding_dim)
+        self.g_layer = nn.Linear(embedding_dim, embedding_dim) # 没有使用
 
     def forward(self, node_emb, cost_mat):
         # NOTE: row and col can be exchanged, if cost_mat.transpose(1,2) is used

@@ -14,9 +14,10 @@ print(sys.path)
 from utils.utils import create_logger, copy_all_src
 from ATSPTester import ATSPTester as Tester
 
+load_ckpt = 'zeroInit_w_edgeValue_w_bias'
+ckpt_path = f'result/train/{load_ckpt}'
 
-
-problem_cnt = 100
+problem_cnt = 200
 
 test_batch_size = {
     100: 1000,
@@ -53,6 +54,7 @@ model_params = {
     'qkv_dim': qkv_dim,
     'sqrt_qkv_dim': qkv_dim**(1/2),
     'head_num': head_num,
+    'init': 'zero',
     'logit_clipping': 50,
     'ff_hidden_dim': 512,
     'ms_hidden_dim': 16,
@@ -66,7 +68,8 @@ tester_params = {
     'use_cuda': USE_CUDA,
     'cuda_device_num': CUDA_DEVICE_NUM,
     'model_load': {
-        'path': 'result/radar_official_checkpoint',
+        # 'path': 'result/radar_official_checkpoint',
+        'path': ckpt_path,
         'epoch': 2100,
     },
     'npz_file': 'dataset/ATSP'+str(problem_cnt)+'.npz',
@@ -80,7 +83,7 @@ if tester_params['augmentation_enable']:
 
 logger_params = {
     'log_file': {
-        'desc': 'atsp_radar_test',
+        'filepath': f'result/test/{problem_cnt}_{load_ckpt}_',
         'filename': 'log.txt'
     }
 }
@@ -92,7 +95,7 @@ def main():
 
     create_logger(**logger_params)
     tester = Tester(env_params, model_params, tester_params)
-    copy_all_src(tester.result_folder)
+    # copy_all_src(tester.result_folder)
     tester.run()
 
 if __name__ == "__main__":

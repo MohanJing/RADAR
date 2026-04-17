@@ -10,6 +10,7 @@ from torch.optim.lr_scheduler import MultiStepLR as Scheduler
 
 from utils.utils import *
 
+import wandb 
 
 class ATSPTrainer:
     def __init__(self,
@@ -62,6 +63,24 @@ class ATSPTrainer:
         # utility
         self.time_estimator = TimeEstimator()
 
+        # ==========================================
+        # 新增: WANDB 初始化
+        # ==========================================
+        # 整合所有参数作为一个巨大的 config 字典
+        wandb_config = {
+            'env_params': self.env_params,
+            'model_params': self.model_params,
+            'optimizer_params': self.optimizer_params,
+            'trainer_params': self.trainer_params
+        }
+        
+        wandb.init(
+            project="RADAR",          # 在 wandb 上的项目名称，可自定义
+            name=f"edge_value", # 运行的名称
+            config=wandb_config,          # 记录超参数
+            resume="allow" if trainer_params['model_load']['enable'] else None # 支持断点续训
+        )
+
     def run(self):
         self.time_estimator.reset(self.start_epoch)
         for epoch in range(self.start_epoch, self.trainer_params['epochs']+1):
@@ -74,6 +93,17 @@ class ATSPTrainer:
             train_score, train_loss = self._train_one_epoch(epoch)
             self.result_log.append('train_score', epoch, train_score)
             self.result_log.append('train_loss', epoch, train_loss)
+
+            # ==========================================
+            # 新增: WANDB 数据记录
+            # ==========================================
+            current_lr = self.optimizer.param_groups[0]['lr'] # 获取当前学习率
+            wandb.log({
+                "epoch": epoch,
+                "train_score": train_score,
+                "train_loss": train_loss,
+                "learning_rate": current_lr
+            }, step=epoch)
 
             ############################
             # Logs & Checkpoint
@@ -116,6 +146,9 @@ class ATSPTrainer:
                 self.logger.info(" *** Training Done *** ")
                 self.logger.info("Now, printing log array...")
                 util_print_log_array(self.logger, self.result_log)
+
+                # 结束 WANDB 进程
+                wandb.finish()
 
     def _train_one_epoch(self, epoch):
 

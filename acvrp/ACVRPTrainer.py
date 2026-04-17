@@ -1,6 +1,8 @@
 import torch
 from logging import getLogger
 
+import wandb
+
 from ACVRPEnv import ACVRPEnv as Env
 from ACVRPModel import ACVRPModel as Model
 
@@ -61,6 +63,23 @@ class ACVRPTrainer:
         # utility
         self.time_estimator = TimeEstimator()
 
+        # ==========================================
+        # [从ATSP迁移] WANDB 初始化
+        # ==========================================
+        wandb_config = {
+            'env_params': self.env_params,
+            'model_params': self.model_params,
+            'optimizer_params': self.optimizer_params,
+            'trainer_params': self.trainer_params
+        }
+
+        wandb.init(
+            project="RADAR",
+            name="acvrp_edge_value",
+            config=wandb_config,
+            resume="allow" if trainer_params['model_load']['enable'] else None
+        )
+
     def run(self):
         self.time_estimator.reset(self.start_epoch)
         for epoch in range(self.start_epoch, self.trainer_params['epochs']+1):
@@ -73,6 +92,17 @@ class ACVRPTrainer:
             train_score, train_loss = self._train_one_epoch(epoch)
             self.result_log.append('train_score', epoch, train_score)
             self.result_log.append('train_loss', epoch, train_loss)
+
+            # ==========================================
+            # [从ATSP迁移] WANDB 数据记录
+            # ==========================================
+            current_lr = self.optimizer.param_groups[0]['lr']
+            wandb.log({
+                "epoch": epoch,
+                "train_score": train_score,
+                "train_loss": train_loss,
+                "learning_rate": current_lr
+            }, step=epoch)
 
             ############################
             # Logs & Checkpoint
@@ -115,6 +145,7 @@ class ACVRPTrainer:
                 self.logger.info(" *** Training Done *** ")
                 self.logger.info("Now, printing log array...")
                 util_print_log_array(self.logger, self.result_log)
+                wandb.finish()
 
     def _train_one_epoch(self, epoch):
 

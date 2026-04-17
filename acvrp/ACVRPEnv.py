@@ -181,7 +181,7 @@ class ACVRPEnv:
 
         self.visited_ninf_flag[self.BATCH_IDX, self.POMO_IDX, node_idx] = float('-inf')
         # shape: (batch, pomo, problem+1)
-        self.visited_ninf_flag[:, :, 0][~self.at_the_depot] = 0  # 禁止频繁回 depot
+        self.visited_ninf_flag[:, :, 0][~self.at_the_depot] = 0  # 禁止频繁回 depot ## 其实是允许返回depot
 
 
         self.ninf_mask = self.visited_ninf_flag.clone()

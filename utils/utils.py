@@ -39,8 +39,7 @@ from collections import OrderedDict
 import json
 import shutil
 
-process_start_time = datetime.now(pytz.timezone("Asia/Seoul"))
-result_folder = './result/' + process_start_time.strftime("%Y%m%d_%H%M%S") + '{desc}'
+result_folder = './result/train/{desc}'
 
 
 def get_result_folder():
@@ -57,7 +56,7 @@ def create_logger(log_file=None):
         log_file['filepath'] = get_result_folder()
 
     if 'desc' in log_file:
-        log_file['filepath'] = log_file['filepath'].format(desc='_' + log_file['desc'])
+        log_file['filepath'] = log_file['filepath'].format(desc=log_file['desc'])
     else:
         log_file['filepath'] = log_file['filepath'].format(desc='')
 

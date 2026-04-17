@@ -26,6 +26,9 @@ import logging
 from utils.utils import create_logger, copy_all_src
 from ACVRPTester import ACVRPTeseter as Tester
 
+load_ckpt = 'zeroInit_w_edgeValue_w_bias'
+ckpt_path = f'result/train/{load_ckpt}'
+
 problem_cnt = 100
 test_batch_size = {
     100: 1000,
@@ -52,6 +55,7 @@ model_params = {
     'qkv_dim': qkv_dim,
     'sqrt_qkv_dim': qkv_dim**(1/2),
     'head_num': head_num,
+    'init': 'zero',
     'logit_clipping': 10,
     'ff_hidden_dim': 512,
     'ms_hidden_dim': 16,
@@ -68,16 +72,18 @@ tester_params = {
     'epochs': 1,
     'train_episodes': 100*1000,
     'test_batch_size': test_batch_size[problem_cnt],
-    'npz_path': f'/common/home/users/h/hang.yi.2024/Code/MatNet-Distance/ACVRP/ACVRP/acvrp_{problem_cnt}_instances.npz',
+    'npz_path': f'dataset/ACVRP'+str(problem_cnt)+'.npz',
     'model_load': {
-        'path': '/common/home/users/h/hang.yi.2024/Code/final_radar/code/acvrp/result/radar_official_checkpoint',
-        'epoch': 2100, 
-    }
+        # 'path': 'result/radar_official_checkpoint',
+        'path': ckpt_path,
+        'epoch': 2100,
+    },
 }
 
 logger_params = {
     'log_file': {
         'desc': '',
+        'filepath': f'result/test/{problem_cnt}_{load_ckpt}',
         'filename': 'log.txt'
     }
 }
@@ -97,7 +103,7 @@ def main():
                       model_params=model_params,
                       tester_params=tester_params)
 
-    copy_all_src(trainer.result_folder)
+    # copy_all_src(trainer.result_folder)
 
     trainer.run()
 

@@ -21,17 +21,23 @@ class ACVRPModel(nn.Module):
 
     def pre_forward(self, reset_state):
         problems, demand = reset_state.problems, reset_state.node_demand  # demand: (batch, n)
+        init_method = self.model_params.get('init', 'svd')
         
-        # 归一化距离矩阵
         mean_val = problems.mean(dim=(1, 2), keepdim=True)
         std_val = problems.std(dim=(1, 2), keepdim=True)
         problems = (problems - mean_val) / (std_val + 1e-9)
-
-        U, S, V = torch.svd_lowrank(problems, q=self.k)
-        sqrt_S = torch.sqrt(S)
-        Q = U * sqrt_S.unsqueeze(1)
-        K = V * sqrt_S.unsqueeze(1)
-        X = torch.cat([Q, K], dim=-1)  # (batch, n+1, 2k)
+        
+        if init_method == 'zero':
+            batch_size, n_plus_1, _ = problems.shape  # n_plus_1 = node_cnt + 1 (包含 depot)
+            X = torch.zeros(batch_size, n_plus_1, 2 * self.k, device=problems.device, dtype=problems.dtype)
+        elif init_method == 'svd':
+            U, S, V = torch.svd_lowrank(problems, q=self.k)
+            sqrt_S = torch.sqrt(S)
+            Q = U * sqrt_S.unsqueeze(1)
+            K = V * sqrt_S.unsqueeze(1)
+            X = torch.cat([Q, K], dim=-1)  # (batch, n+1, 2k)
+        else:
+            raise ValueError(f"Unknown init method: {init_method}")
 
         depot_zeros = torch.zeros((demand.shape[0], 1), device=demand.device)
         full_demand = torch.cat([depot_zeros, demand], dim=1)  # (batch, n+1)
