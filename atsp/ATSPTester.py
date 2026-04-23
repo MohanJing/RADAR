@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 from logging import getLogger
@@ -49,10 +50,17 @@ class ATSPTester:
         episode = 0
         total = self.all_problems.size(0)
         batch_size = self.tester_params['test_batch_size']
+        node_cnt = self.env_params['node_cnt']
+
+        all_best_routes = np.zeros((total, node_cnt), dtype=np.int64)
+        all_best_costs = np.zeros((total,), dtype=np.float32)
 
         while episode < total:
             bs = min(batch_size, total - episode)
-            score, aug_score, score_std, aug_score_std = self._test_one_batch(episode, episode + bs)
+            score, aug_score, score_std, aug_score_std, batch_best_routes, batch_best_costs = self._test_one_batch(episode, episode + bs)
+
+            all_best_routes[episode:episode+bs] = batch_best_routes
+            all_best_costs[episode:episode+bs] = batch_best_costs
 
             score_AM.update(score, bs)
             aug_score_AM.update(aug_score, bs)
@@ -70,12 +78,19 @@ class ATSPTester:
         self.logger.info(f"NO-AUG SCORE: {score_AM.avg:.4f} ± {score_std_AM.avg:.4f}")
         self.logger.info(f"AUGMENTED SCORE: {aug_score_AM.avg:.4f} ± {aug_score_std_AM.avg:.4f}")
 
+        save_dir = os.path.join(os.path.dirname(__file__), 'result/answer')
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"res_{self.tester_params['model_load']['path'].split('/')[-1]}_{self.env_params['node_cnt']}.npz")
+        np.savez(save_path, tour=all_best_routes, cost=all_best_costs)
+        self.logger.info(f"Saved inference results to {save_path}")
+
     def _test_one_batch(self, idx_start, idx_end):
         problems = self.all_problems[idx_start:idx_end]  # shape: (batch, node, node)
         aug_factor = self.tester_params['aug_factor'] if self.tester_params['augmentation_enable'] else 1
         batch_size = 3
 
         all_rewards = []
+        all_best_routes = []
 
         self.model.eval()
         with torch.no_grad():
@@ -96,15 +111,37 @@ class ATSPTester:
                     state, reward, done = self.env.step(selected)
 
                 reward = reward.view(current_batch, base, self.env.pomo_size)
-                max_pomo = reward.max(dim=2)[0] 
-                all_rewards.append(max_pomo)  
+                selected_nodes = self.env.selected_node_list.view(
+                    current_batch, base, self.env.pomo_size, self.env.node_cnt
+                )
 
-            all_rewards = torch.cat(all_rewards, dim=0)  
+                best_pomo_idx = reward.argmax(dim=2)
+                batch_idx = torch.arange(current_batch, device=reward.device)[:, None].expand(current_batch, base)
+                problem_idx = torch.arange(base, device=reward.device)[None, :].expand(current_batch, base)
+                best_routes = selected_nodes[batch_idx, problem_idx, best_pomo_idx]
+
+                all_rewards.append(reward.max(dim=2)[0])
+                all_best_routes.append(best_routes)
+
+            all_rewards = torch.cat(all_rewards, dim=0)
+            all_best_routes = torch.cat(all_best_routes, dim=0)
+
+            best_aug_idx = all_rewards.argmax(dim=0)
+            problem_idx = torch.arange(base, device=best_aug_idx.device)
+            best_routes_overall = all_best_routes[best_aug_idx, problem_idx]
+            best_costs = -all_rewards.max(dim=0)[0].float()
 
             no_aug = -all_rewards[0].float().mean()
             no_aug_std = all_rewards[0].float().std()
 
-            aug = -all_rewards.max(dim=0)[0].float().mean()
-            aug_std = all_rewards.max(dim=0)[0].float().std()
+            aug = best_costs.mean()
+            aug_std = best_costs.std()
 
-            return no_aug.item(), aug.item(), no_aug_std.item(), aug_std.item()
+            return (
+                no_aug.item(),
+                aug.item(),
+                no_aug_std.item(),
+                aug_std.item(),
+                best_routes_overall.cpu().numpy(),
+                best_costs.cpu().numpy(),
+            )

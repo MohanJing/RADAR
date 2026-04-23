@@ -5,6 +5,8 @@ CUDA_DEVICE_NUM = 0
 
 import os
 import sys
+import torch
+import numpy as np
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "..")  # for problem_def
@@ -14,10 +16,13 @@ print(sys.path)
 from utils.utils import create_logger, copy_all_src
 from ATSPTester import ATSPTester as Tester
 
-load_ckpt = 'zeroInit_w_edgeValue_w_bias'
+# Set random seeds
+SEED = 1234
+
+load_ckpt = 'zeroInit_w_edgeValue_wo_bias_vp2'
 ckpt_path = f'result/train/{load_ckpt}'
 
-problem_cnt = 200
+problem_cnt = 500
 
 test_batch_size = {
     100: 1000,
@@ -54,7 +59,7 @@ model_params = {
     'qkv_dim': qkv_dim,
     'sqrt_qkv_dim': qkv_dim**(1/2),
     'head_num': head_num,
-    'init': 'zero',
+    'init': 'svd',
     'logit_clipping': 50,
     'ff_hidden_dim': 512,
     'ms_hidden_dim': 16,
@@ -75,8 +80,8 @@ tester_params = {
     'npz_file': 'dataset/ATSP'+str(problem_cnt)+'.npz',
     'test_batch_size': test_batch_size[problem_cnt],
     'augmentation_enable': False,
-    'aug_factor': 128,
-    'aug_batch_size': 10,
+    'aug_factor': 128, # 每个问题重复推理 128 次
+    'aug_batch_size': 10, # 增强时的批大小
 }
 if tester_params['augmentation_enable']:
     tester_params['test_batch_size'] = tester_params['aug_batch_size']
@@ -89,6 +94,14 @@ logger_params = {
 }
 
 def main():
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
     if DEBUG_MODE:
         tester_params['aug_factor'] = 10
         tester_params['test_batch_size'] = 10

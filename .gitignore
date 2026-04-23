@@ -2,6 +2,8 @@
 **/dataset/
 **/result/
 **/wand/
+**/*.png
+**/*.jpg
 
 
 # Data folder. If needed, add files with git add -f <file>

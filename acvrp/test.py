@@ -12,6 +12,8 @@ CUDA_DEVICE_NUM = 0
 
 import os
 import sys
+import torch
+import numpy as np
  
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "..") 
@@ -26,10 +28,13 @@ import logging
 from utils.utils import create_logger, copy_all_src
 from ACVRPTester import ACVRPTeseter as Tester
 
-load_ckpt = 'zeroInit_w_edgeValue_w_bias'
+# Set random seeds
+SEED = 1234
+
+load_ckpt = 'svdInit_w_edgeValue_w_bias'
 ckpt_path = f'result/train/{load_ckpt}'
 
-problem_cnt = 100
+problem_cnt = 200
 test_batch_size = {
     100: 1000,
     200: 400,
@@ -55,7 +60,7 @@ model_params = {
     'qkv_dim': qkv_dim,
     'sqrt_qkv_dim': qkv_dim**(1/2),
     'head_num': head_num,
-    'init': 'zero',
+    'init': 'svd',
     'logit_clipping': 10,
     'ff_hidden_dim': 512,
     'ms_hidden_dim': 16,
@@ -93,6 +98,13 @@ logger_params = {
 # main
 
 def main():
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     if DEBUG_MODE:
         _set_debug_mode()
 

@@ -30,7 +30,7 @@ class ATSPModel(nn.Module):
         if init_method == 'zero':
             batch_size, n, _ = problems.shape
             X = torch.zeros(batch_size, n, 2*self.k, device=problems.device, dtype=problems.dtype)
-            # final_embedding = torch.zeros(batch_size, n, self.embedding_dim, device=problems.device, dtype=problems.dtype)
+            final_embedding = torch.zeros(batch_size, n, self.embedding_dim, device=problems.device, dtype=problems.dtype)
         elif init_method == 'svd':
             U, S, V = torch.svd_lowrank(problems, q=self.k)
             sqrt_S = torch.sqrt(S)  # (batch, k)
@@ -40,11 +40,11 @@ class ATSPModel(nn.Module):
 
             X = torch.cat([Q, K], dim=-1)  # (batch, n, 2*k)
 
-            # final_embedding = self.projection(X)
+            final_embedding = self.projection(X)
         else:
             raise ValueError(f"Unknown init method: {init_method}")
 
-        final_embedding = self.projection(X)
+        # final_embedding = self.projection(X)
         
         self.encoded_node = self.encoder(final_embedding, problems)
         self.decoder.set_kv(self.encoded_node)

@@ -71,7 +71,7 @@ model_params = {
     'qkv_dim': qkv_dim,
     'sqrt_qkv_dim': qkv_dim**(1/2),
     'head_num': head_num,
-    'init': 'zero',
+    'init': 'svd',
     'att_type': 'normal',
     'logit_clipping': 10,
     'ff_hidden_dim': 512,
