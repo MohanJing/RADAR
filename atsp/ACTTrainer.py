@@ -2,7 +2,8 @@ import torch
 from logging import getLogger
 
 from ATSPEnv import ATSPEnv as Env
-from ATSPModel import ATSPModel as Model
+# from ATSPModel import ATSPModel as Model
+from ACTmodel import ATSPModel as Model
 from ATSPModel_LIB import *
 
 from torch.optim import Adam as Optimizer
@@ -76,7 +77,7 @@ class ATSPTrainer:
         
         wandb.init(
             project="RADAR",          # 在 wandb 上的项目名称，可自定义
-            name=f"sinkhorn_mix_full", # 运行的名称
+            name=f"ACTsinkhorn", # 运行的名称
             config=wandb_config,          # 记录超参数
             resume="allow" if trainer_params['model_load']['enable'] else None # 支持断点续训
         )
@@ -90,9 +91,10 @@ class ATSPTrainer:
             self.scheduler.step()
 
             # Train
-            train_score, train_loss = self._train_one_epoch(epoch)
+            train_score, train_loss, train_ponder = self._train_one_epoch(epoch) # 接收 ponder
             self.result_log.append('train_score', epoch, train_score)
             self.result_log.append('train_loss', epoch, train_loss)
+            self.result_log.append('train_ponder', epoch, train_ponder) # 存入 log
 
             # ==========================================
             # 新增: WANDB 数据记录
@@ -102,6 +104,7 @@ class ATSPTrainer:
                 "epoch": epoch,
                 "train_score": train_score,
                 "train_loss": train_loss,
+                "train_ponder": train_ponder, # 关键监控指标！
                 "learning_rate": current_lr
             }, step=epoch)
 
@@ -154,6 +157,7 @@ class ATSPTrainer:
 
         score_AM = AverageMeter()
         loss_AM = AverageMeter()
+        ponder_AM = AverageMeter()  # 新增: 记录 Ponder Cost
 
         train_num_episode = self.trainer_params['train_episodes']
         episode = 0
@@ -163,9 +167,10 @@ class ATSPTrainer:
             remaining = train_num_episode - episode
             batch_size = min(self.trainer_params['train_batch_size'], remaining)
 
-            avg_score, avg_loss = self._train_one_batch(batch_size)
+            avg_score, avg_loss, avg_ponder = self._train_one_batch(batch_size)
             score_AM.update(avg_score, batch_size)
             loss_AM.update(avg_loss, batch_size)
+            ponder_AM.update(avg_ponder, batch_size)
 
             episode += batch_size
 
@@ -182,7 +187,7 @@ class ATSPTrainer:
                          .format(epoch, 100. * episode / train_num_episode,
                                  score_AM.avg, loss_AM.avg))
 
-        return score_AM.avg, loss_AM.avg
+        return score_AM.avg, loss_AM.avg, ponder_AM.avg
 
     def _train_one_batch(self, batch_size):
 
@@ -218,6 +223,16 @@ class ATSPTrainer:
 
         loss_mean = loss_mean 
 
+        # ==========================================
+        # 新增: 获取并计算带有 Ponder Cost 的总 Loss
+        # ==========================================
+        # 建议在外部 config (trainer_params) 中设置 ponder_lambda，默认可给 0.001
+        ponder_lambda = self.trainer_params.get('ponder_lambda', 0.001) 
+        ponder_cost = self.model.ponder_cost  # 从 pre_forward 阶段保留的思考成本
+        
+        loss_total = loss_mean + ponder_lambda * ponder_cost
+        # ==========================================
+
         # Score
         ###############################################
         max_pomo_reward, _ = reward.max(dim=1)  # get best results from pomo
@@ -226,6 +241,7 @@ class ATSPTrainer:
         # Step & Return
         ###############################################
         self.model.zero_grad()
-        loss_mean.backward()
+        # loss_mean.backward()
+        loss_total.backward()   # 注意：这里是对带有惩罚的 loss_total 进行反向传播
         self.optimizer.step()
-        return score_mean.item(), loss_mean.item()
+        return score_mean.item(), loss_mean.item(), ponder_cost.item() # 将 ponder_cost 也返回，用于监控

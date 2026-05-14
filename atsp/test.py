@@ -19,10 +19,10 @@ from ATSPTester import ATSPTester as Tester
 # Set random seeds
 SEED = 1234
 
-load_ckpt = 'zeroInit_w_edgeValue_wo_bias_vp2'
+load_ckpt = 'full_mix'
 ckpt_path = f'result/train/{load_ckpt}'
 
-problem_cnt = 500
+problem_cnt = 100
 
 test_batch_size = {
     100: 1000,
@@ -77,7 +77,7 @@ tester_params = {
         'path': ckpt_path,
         'epoch': 2100,
     },
-    'npz_file': 'dataset/ATSP'+str(problem_cnt)+'.npz',
+    'npz_file': 'dataset/dataset_10k/sampled_symmetry_p100/ATSP'+str(problem_cnt)+'_10k.npz', # 输入数据
     'test_batch_size': test_batch_size[problem_cnt],
     'augmentation_enable': False,
     'aug_factor': 128, # 每个问题重复推理 128 次
@@ -88,7 +88,7 @@ if tester_params['augmentation_enable']:
 
 logger_params = {
     'log_file': {
-        'filepath': f'result/test/{problem_cnt}_{load_ckpt}_',
+        'filepath': f'result/test/sampled_symmetry/{problem_cnt}_{load_ckpt}_p100',
         'filename': 'log.txt'
     }
 }

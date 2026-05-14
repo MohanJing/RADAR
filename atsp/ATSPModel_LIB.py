@@ -1,4 +1,4 @@
-
+from ACTsinkhorn import ACTSinkhorn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -67,18 +67,8 @@ class MixedScore_MultiHeadAttention(nn.Module):
         self.mix2_bias = nn.Parameter(mix2_bias)
         # shape: (head, 1)
 
-        # =========================================================
-        # [新增] 边特征到 Value 空间的投影权重
-        # 为了稳定训练，使用较小的方差初始化，让网络逐渐学习边特征的融入
-        # =========================================================
-        qkv_dim = self.model_params['qkv_dim']
-        
-        # 映射前向距离 cost_mat_{ij} (i 到 j 的成本)
-        # self.W_v_edge_fwd = nn.Parameter(torch.randn(head_num, qkv_dim) * 0.02)
-        # 映射反向距离 cost_mat_{ji} (j 到 i 的成本)
-        # self.W_v_edge_bwd = nn.Parameter(torch.randn(head_num, qkv_dim) * 0.02)
-        # # 映射距离 
-        self.W_edge = nn.Parameter(torch.randn(head_num, 2, qkv_dim) * 0.02)
+        # 初始化 ACT Sinkhorn，设定一个合理的最大允许单次操作上限，如 20 次操作 (=10个完整行列迭代)
+        # self.act_sinkhorn = ACTSinkhorn(max_steps=20, eps=1e-3)
 
     def forward(self, q, k, v, cost_mat):
         # q shape: (batch, head_num, row_cnt, qkv_dim)
@@ -127,68 +117,27 @@ class MixedScore_MultiHeadAttention(nn.Module):
         # mixed_scores = dot_product / sqrt_qkv_dim  # 直接使用原始score，不用混合得分
         # shape: (batch, head_num, row_cnt, col_cnt)
 
-        # weights = nn.Softmax(dim=3)(mixed_scores)
+        # ========= 保存归一化前的原始打分 (Raw Scores) =========
+        # self.last_raw_scores = mixed_scores.detach().cpu()
+        
+        # 顺便提前算一下 dim=2 和 dim=3 的 Softmax 单纯拿去画图用
+        # self.last_softmax_dim2 = F.softmax(mixed_scores, dim=2).detach().cpu()
+        # self.last_softmax_dim3 = F.softmax(mixed_scores, dim=3).detach().cpu()
+        # =======================================================
+
+        # weights = nn.Softmax(dim=2)(mixed_scores)
+        # weights = self.act_sinkhorn(mixed_scores)
         weights = sinkhorn_normalization(mixed_scores)
+
+        # ========= 保存归一化之后的注意力权重 (Attention Weights) =========
+        # self.last_attention_weights = weights.detach().cpu()
+        # =================================================================
 
         # shape: (batch, head_num, row_cnt, col_cnt)
 
         out = torch.matmul(weights, v)
         # shape: (batch, head_num, row_cnt, qkv_dim)
         
-        # # =========================================================
-        # # v0.1版本
-        # # 1. 计算前向和反向的距离矩阵，并强制转换为连续内存 (彻底杜绝寻址错误)
-        # # cost_fwd shape: (batch, 1, row_cnt, col_cnt)
-        # cost_fwd = cost_mat.unsqueeze(1) 
-        # # cost_bwd shape: (batch, 1, col_cnt, row_cnt) -> 注意这里的 .contiguous() 是救命的
-        # cost_bwd = cost_mat.transpose(1, 2).contiguous().unsqueeze(1)
-
-        # # 2. 先加权求和计算标量聚合 (利用广播机制)
-        # # S_fwd/S_bwd shape: (batch, head_num, row_cnt)
-        # S_fwd = torch.sum(weights * cost_fwd, dim=3)
-        # S_bwd = torch.sum(weights * cost_bwd, dim=3)
-
-        # # 3. 最后乘以投影权重映射到高维空间
-        # # self.W_v_edge_fwd shape: (head_num, qkv_dim)
-        # # 利用 unsqueeze 扩展维度进行广播乘法: [B, H, R, 1] * [1, H, 1, D] -> [B, H, R, D]
-        # out_edge_fwd = S_fwd.unsqueeze(3) * self.W_v_edge_fwd.unsqueeze(0).unsqueeze(2)
-        # out_edge_bwd = S_bwd.unsqueeze(3) * self.W_v_edge_bwd.unsqueeze(0).unsqueeze(2)
-
-        # # 4. 联合融合
-        # out = out + out_edge_fwd + out_edge_bwd
-        # # shape: (batch, head_num, row_cnt, qkv_dim)
-
-        # # =========================================================
-
-        # =========================================================
-        # v0.2版本
-        # =========================================================
-        # 1. 只需要前向距离矩阵
-        # cost_fwd shape: (batch, 1, row_cnt, col_cnt)
-        cost_fwd = cost_mat.unsqueeze(1) 
-
-        # 2. 分别沿列和行聚合，提取传出(Outbound)与传入(Inbound)标量特征
-        # S_outbound (原S_fwd): 节点i走向前方的期望成本 -> 沿 dim=3 (Key维度) 求和
-        # S_inbound (原S_bwd): 其他节点走向节点i的期望成本 -> 沿 dim=2 (Query维度) 求和
-        # 结果 shape: (batch, head_num, node_cnt)
-        S_outbound = torch.sum(weights * cost_fwd, dim=3)
-        S_inbound = torch.sum(weights * cost_fwd, dim=2)
-
-        # 3. 在最后一个维度拼接两个标量特征
-        # S_concat shape: (batch, head_num, node_cnt, 2)
-        S_concat = torch.stack([S_outbound, S_inbound], dim=3)
-
-        # 4. 利用一次矩阵乘法完成高维投影
-        # self.W_edge.unsqueeze(0) shape: (1, head_num, 2, qkv_dim)
-        # 广播乘法: [B, H, N, 2] @ [1, H, 2, D] -> [B, H, N, D]
-        out_edge = torch.matmul(S_concat, self.W_edge.unsqueeze(0))
-
-        # 5. 联合融合
-        out = out + out_edge
-        # shape: (batch, head_num, row_cnt, qkv_dim)
-        # =========================================================
-
-
         out_transposed = out.transpose(1, 2)
         # shape: (batch, row_cnt, head_num, qkv_dim)
 

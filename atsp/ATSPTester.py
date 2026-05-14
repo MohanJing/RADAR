@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import numpy as np
 from logging import getLogger
@@ -6,6 +7,9 @@ from logging import getLogger
 from ATSPEnv import ATSPEnv as Env
 from ATSPModel import ATSPModel as Model
 from utils.utils import get_result_folder, AverageMeter, TimeEstimator
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from analysis.visualize_attention import visualize_attention_all_heads_raw_for_samples
 
 class ATSPTester:
     def __init__(self, env_params, model_params, tester_params):
@@ -33,11 +37,15 @@ class ATSPTester:
         self.model.load_state_dict(checkpoint['model_state_dict'])
 
         self.time_estimator = TimeEstimator()
+        self.attn_visualized = True
+        # self.visualize_sample_indices = set(self.tester_params.get('visualize_sample_indices', []))
+        self.visualize_sample_indices = set([2316, 7414, 7600, 4959, 5021]) # 最差的5个样本索引
+        self.visualized_sample_indices = set()
 
         # Load npz data
         npz_path = tester_params['npz_file']
         data = np.load(npz_path)['data']  # shape: (batch, node_cnt, node_cnt)
-        data = data / (1000 * 1000)
+        # data = data / (1000 * 1000)
         self.all_problems = torch.tensor(data, dtype=torch.float32)
 
     def run(self):
@@ -78,11 +86,11 @@ class ATSPTester:
         self.logger.info(f"NO-AUG SCORE: {score_AM.avg:.4f} ± {score_std_AM.avg:.4f}")
         self.logger.info(f"AUGMENTED SCORE: {aug_score_AM.avg:.4f} ± {aug_score_std_AM.avg:.4f}")
 
-        save_dir = os.path.join(os.path.dirname(__file__), 'result/answer')
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f"res_{self.tester_params['model_load']['path'].split('/')[-1]}_{self.env_params['node_cnt']}.npz")
-        np.savez(save_path, tour=all_best_routes, cost=all_best_costs)
-        self.logger.info(f"Saved inference results to {save_path}")
+        # save_dir = os.path.join(os.path.dirname(__file__), 'result/answer/sampled_symmetry')
+        # os.makedirs(save_dir, exist_ok=True)
+        # save_path = os.path.join(save_dir, f"res_{self.tester_params['model_load']['path'].split('/')[-1]}_{self.env_params['node_cnt']}.npz")
+        # np.savez(save_path, tour=all_best_routes, cost=all_best_costs)
+        # self.logger.info(f"Saved inference results to {save_path}")
 
     def _test_one_batch(self, idx_start, idx_end):
         problems = self.all_problems[idx_start:idx_end]  # shape: (batch, node, node)
@@ -104,6 +112,22 @@ class ATSPTester:
                 self.env.load_problems_manual(problems_aug)
                 reset_state, _, _ = self.env.reset()
                 self.model.pre_forward(reset_state)
+
+                # 可视化注意力
+                # target_sample_indices = [
+                #     idx for idx in self.visualize_sample_indices
+                #     if idx_start <= idx < idx_end and idx not in self.visualized_sample_indices
+                # ]
+                # if target_sample_indices:
+                #     visualize_attention_all_heads_raw_for_samples(
+                #         self.model,
+                #         self.logger,
+                #         self.result_folder,
+                #         target_sample_indices,
+                #         batch_start_idx=idx_start,
+                #         layer_idx=4,
+                #     )
+                #     self.visualized_sample_indices.update(target_sample_indices)
 
                 state, reward, done = self.env.pre_step()
                 while not done:

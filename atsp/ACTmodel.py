@@ -74,6 +74,10 @@ class ATSPModel(nn.Module):
         # final_embedding = self.projection(X)
         
         self.encoded_node = self.encoder(final_embedding, problems)
+
+        # 将 encoder 产生的全局 ponder cost 暴露给主模型，方便你在 trainer.py 提取
+        self.ponder_cost = self.encoder.ponder_cost
+
         self.decoder.set_kv(self.encoded_node)
 
 
@@ -141,16 +145,19 @@ class ATSP_Encoder(nn.Module):
         super().__init__()
         encoder_layer_num = model_params['encoder_layer_num']
         self.layers = nn.ModuleList([EncodingBlock(**model_params) for _ in range(encoder_layer_num)])
+        self.ponder_cost = 0.0 # 用于累加全局惩罚
 
     def forward(self, node_emb, cost_mat):
         # col_emb.shape: (batch, col_cnt, embedding)
         # row_emb.shape: (batch, row_cnt, embedding)
         # cost_mat.shape: (batch, row_cnt, col_cnt)
+        total_ponder_cost = 0.0
 
         for layer in self.layers:
             node_emb = layer(node_emb, cost_mat)
-        
+            total_ponder_cost += layer.ponder_cost  # 累积每层的计算时间成本
 
+        self.ponder_cost = total_ponder_cost
         return node_emb
 
 
@@ -179,6 +186,8 @@ class EncodingBlock(nn.Module):
 
         self.g_layer = nn.Linear(embedding_dim, embedding_dim) # 没有使用
 
+        self.ponder_cost = 0.0
+
     def forward(self, node_emb, cost_mat):
         # NOTE: row and col can be exchanged, if cost_mat.transpose(1,2) is used
         # input1.shape: (batch, row_cnt, embedding)
@@ -197,6 +206,9 @@ class EncodingBlock(nn.Module):
 
         multi_head_out = self.multi_head_combine(out_concat)
         # shape: (batch, row_cnt, embedding)
+
+        # 从 act_sinkhorn 抓取思考成本
+        self.ponder_cost = self.mixed_score_MHA.act_sinkhorn.ponder_cost
 
         out1 = self.add_n_normalization_1(node_emb, multi_head_out)
         out2 = self.feed_forward(out1)

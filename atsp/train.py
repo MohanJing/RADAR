@@ -15,7 +15,7 @@ os.environ['PYTHONHASHSEED'] = '42'
 problems_size = 100
 head_num = 8
 embedding_dim = 256
-name = 'radar'
+name = 'ACTsinkhorn'
 qkv_dim = embedding_dim // head_num 
 
 ##########################################################################################
@@ -37,7 +37,8 @@ print(sys.path)
 import logging
 
 from utils.utils import create_logger, copy_all_src
-from ATSPTrainer import ATSPTrainer as Trainer
+# from ATSPTrainer import ATSPTrainer as Trainer
+from ACTTrainer import ATSPTrainer as Trainer
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -61,7 +62,8 @@ env_params = {
         'int_max': 1000*1000,
         'scaler': 1000*1000
     },
-    'pomo_size': problems_size  # same as node_cnt
+    'pomo_size': problems_size,  # same as node_cnt
+    'mix_tsp': False
 }
 
 model_params = {
