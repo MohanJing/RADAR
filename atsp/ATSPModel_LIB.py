@@ -67,8 +67,9 @@ class MixedScore_MultiHeadAttention(nn.Module):
         self.mix2_bias = nn.Parameter(mix2_bias)
         # shape: (head, 1)
 
+        self.k_iter = model_params.get('k_iter', 20)
         # 初始化 ACT Sinkhorn，设定一个合理的最大允许单次操作上限，如 20 次操作 (=10个完整行列迭代)
-        # self.act_sinkhorn = ACTSinkhorn(max_steps=20, eps=1e-3)
+        self.act_sinkhorn = ACTSinkhorn(max_steps=20, eps=1e-3)
 
     def forward(self, q, k, v, cost_mat):
         # q shape: (batch, head_num, row_cnt, qkv_dim)
@@ -125,9 +126,10 @@ class MixedScore_MultiHeadAttention(nn.Module):
         # self.last_softmax_dim3 = F.softmax(mixed_scores, dim=3).detach().cpu()
         # =======================================================
 
-        # weights = nn.Softmax(dim=2)(mixed_scores)
-        # weights = self.act_sinkhorn(mixed_scores)
-        weights = sinkhorn_normalization(mixed_scores)
+        # weights = nn.Softmax(dim=3)(mixed_scores)
+        weights = self.act_sinkhorn(mixed_scores)
+        # weights = sinkhorn_normalization_k(mixed_scores, k_iter=self.k_iter) 
+        # weights = sinkhorn_normalization(mixed_scores)
 
         # ========= 保存归一化之后的注意力权重 (Attention Weights) =========
         # self.last_attention_weights = weights.detach().cpu()
@@ -152,4 +154,22 @@ def sinkhorn_normalization(scores, n_iter=10):
     for _ in range(n_iter):
         scores = scores - scores.logsumexp(dim=-1, keepdim=True)
         scores = scores - scores.logsumexp(dim=-2, keepdim=True)
+    return scores.exp()
+
+def sinkhorn_normalization_k(scores, k_iter=20):
+    # 过滤无效输入，k=0 时直接返回非负权重（假设需求如此）
+    if k_iter == 0:
+        return torch.ones_like(scores) / scores.shape[-1]
+        
+    num_steps = abs(k_iter)
+    start_dim = -2 if k_iter < 0 else -1
+    
+    # 【修复点】：初始稳定性处理必须沿着起始维度 start_dim 进行
+    scores = scores - scores.max(dim=start_dim, keepdim=True)[0]
+    
+    for i in range(num_steps):
+        current_dim = start_dim if i % 2 == 0 else (-3 - start_dim) 
+        # logsumexp 自带数值稳定性，连续调用不会导致溢出
+        scores = scores - scores.logsumexp(dim=current_dim, keepdim=True)
+        
     return scores.exp()

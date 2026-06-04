@@ -74,8 +74,8 @@ class ACVRPTrainer:
         }
 
         wandb.init(
-            project="RADAR",
-            name="acvrp_edge_value",
+            project="RADAR_cvrp",
+            name="sinkhorn_k_iter_20",
             config=wandb_config,
             resume="allow" if trainer_params['model_load']['enable'] else None
         )

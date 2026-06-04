@@ -5,7 +5,8 @@ import numpy as np
 from logging import getLogger
 
 from ATSPEnv import ATSPEnv as Env
-from ATSPModel import ATSPModel as Model
+# from ATSPModel import ATSPModel as Model
+from ACTmodel import ATSPModel as Model
 from utils.utils import get_result_folder, AverageMeter, TimeEstimator
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -43,10 +44,13 @@ class ATSPTester:
         self.visualized_sample_indices = set()
 
         # Load npz data
-        npz_path = tester_params['npz_file']
-        data = np.load(npz_path)['data']  # shape: (batch, node_cnt, node_cnt)
-        # data = data / (1000 * 1000)
-        self.all_problems = torch.tensor(data, dtype=torch.float32)
+        if tester_params.get('npz_file'):
+            npz_path = tester_params['npz_file']
+            data = np.load(npz_path)['data']  # shape: (batch, node_cnt, node_cnt)
+            data = data / (1000 * 1000)
+            self.all_problems = torch.tensor(data, dtype=torch.float32)
+        else:
+            self.all_problems = None
 
     def run(self):
         self.time_estimator.reset()
@@ -169,3 +173,18 @@ class ATSPTester:
                 best_routes_overall.cpu().numpy(),
                 best_costs.cpu().numpy(),
             )
+
+    def test_single_instance(self, dist_matrix, problem_name=""):
+        N = dist_matrix.shape[0]
+        self.env_params['node_cnt'] = N
+        self.env_params['pomo_size'] = min(N, 1000)
+        self.env = Env(**self.env_params)
+        
+        # dist_matrix is a numpy array of shape (N, N). Add batch dimension
+        data = np.expand_dims(dist_matrix, axis=0)
+        self.all_problems = torch.tensor(data, dtype=torch.float32)
+        
+        score, aug_score, score_std, aug_score_std, batch_best_routes, batch_best_costs = self._test_one_batch(0, 1)
+        
+        self.logger.info(f"[{problem_name}] Nodes: {N}, POMO: {self.env_params['pomo_size']}, Cost: {batch_best_costs[0]:.4f}")
+        return batch_best_routes[0], batch_best_costs[0]

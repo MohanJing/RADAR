@@ -66,13 +66,6 @@ class MixedScore_MultiHeadAttention(nn.Module):
         self.mix2_bias = nn.Parameter(mix2_bias)
         # shape: (head, 1)
 
-        # =========================================================
-        # [从ATSP迁移] 边特征到 Value 空间的投影权重
-        # =========================================================
-        qkv_dim = self.model_params['qkv_dim']
-        self.W_v_edge_fwd = nn.Parameter(torch.randn(head_num, qkv_dim) * 0.02)
-        self.W_v_edge_bwd = nn.Parameter(torch.randn(head_num, qkv_dim) * 0.02)
-
     def forward(self, q, k, v, cost_mat):
         # q shape: (batch, head_num, row_cnt, qkv_dim)
         # k,v shape: (batch, head_num, col_cnt, qkv_dim)
@@ -122,28 +115,13 @@ class MixedScore_MultiHeadAttention(nn.Module):
         # shape: (batch, head_num, row_cnt, col_cnt)
 
         # weights = nn.Softmax(dim=3)(mixed_scores)
-        weights = sinkhorn_normalization(mixed_scores)
+        weights = sinkhorn_normalization_k(mixed_scores, k_iter=20)
+        # weights = sinkhorn_normalization(mixed_scores)
 
         # shape: (batch, head_num, row_cnt, col_cnt)
 
         out = torch.matmul(weights, v)
         # shape: (batch, head_num, row_cnt, qkv_dim)
-
-        # =========================================================
-        # [从ATSP迁移] 边特征融合到 Value 空间
-        # =========================================================
-        cost_fwd = cost_mat.unsqueeze(1)
-        cost_bwd = cost_mat.transpose(1, 2).contiguous().unsqueeze(1)
-
-        S_fwd = torch.sum(weights * cost_fwd, dim=3)
-        S_bwd = torch.sum(weights * cost_bwd, dim=3)
-
-        out_edge_fwd = S_fwd.unsqueeze(3) * self.W_v_edge_fwd.unsqueeze(0).unsqueeze(2)
-        out_edge_bwd = S_bwd.unsqueeze(3) * self.W_v_edge_bwd.unsqueeze(0).unsqueeze(2)
-
-        out = out + out_edge_fwd + out_edge_bwd
-        # shape: (batch, head_num, row_cnt, qkv_dim)
-        # =========================================================
 
         out_transposed = out.transpose(1, 2)
         # shape: (batch, row_cnt, head_num, qkv_dim)
@@ -159,4 +137,22 @@ def sinkhorn_normalization(scores, n_iter=10):
     for _ in range(n_iter):
         scores = scores - scores.logsumexp(dim=-1, keepdim=True)
         scores = scores - scores.logsumexp(dim=-2, keepdim=True)
+    return scores.exp()
+
+def sinkhorn_normalization_k(scores, k_iter=20):
+    # 过滤无效输入，k=0 时直接返回非负权重（假设需求如此）
+    if k_iter == 0:
+        return torch.ones_like(scores) / scores.shape[-1]
+        
+    num_steps = abs(k_iter)
+    start_dim = -2 if k_iter < 0 else -1
+    
+    # 【修复点】：初始稳定性处理必须沿着起始维度 start_dim 进行
+    scores = scores - scores.max(dim=start_dim, keepdim=True)[0]
+    
+    for i in range(num_steps):
+        current_dim = start_dim if i % 2 == 0 else (-3 - start_dim) 
+        # logsumexp 自带数值稳定性，连续调用不会导致溢出
+        scores = scores - scores.logsumexp(dim=current_dim, keepdim=True)
+        
     return scores.exp()

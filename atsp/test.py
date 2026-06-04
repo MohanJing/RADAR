@@ -7,6 +7,14 @@ import os
 import sys
 import torch
 import numpy as np
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--p', type=int, default=0, help='symmetry level p')
+parser.add_argument('--k', type=int, default=-10, help='k iteration for sinkhorn')
+parser.add_argument('--node', type=int, default=100, help='problem size')
+parser.add_argument('--ckpt', type=str, default='radar_official_checkpoint', help='checkpoint name in result/train/')
+args, _ = parser.parse_known_args()
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "..")  # for problem_def
@@ -19,13 +27,15 @@ from ATSPTester import ATSPTester as Tester
 # Set random seeds
 SEED = 1234
 
-load_ckpt = 'full_mix'
+# load_ckpt = 'radar_official_checkpoint'
+load_ckpt = args.ckpt
 ckpt_path = f'result/train/{load_ckpt}'
 
-problem_cnt = 100
+# problem_cnt = 1000
+problem_cnt = args.node
 
 test_batch_size = {
-    100: 1000,
+    100: 100,
     200: 400,
     500: 50,
     1000: 3   
@@ -67,6 +77,7 @@ model_params = {
     'ms_layer2_init': (1/16)**(1/2),
     'eval_type': 'softmax',
     'one_hot_seed_cnt': problem_cnt,  # must be >= node_cnt
+    'k_iter': args.k,
 }
 
 tester_params = {
@@ -77,7 +88,10 @@ tester_params = {
         'path': ckpt_path,
         'epoch': 2100,
     },
-    'npz_file': 'dataset/dataset_10k/sampled_symmetry_p100/ATSP'+str(problem_cnt)+'_10k.npz', # 输入数据
+    # 'npz_file': f'/data/jinmohan/RADAR/atsp/dataset/ATSP500.npz', # 原始输入数据
+    'npz_file': f'/data/jinmohan/NCOdata/atsp_1k/sampled_symmetry_p{args.p}/ATSP{problem_cnt}.npz', # 满足三角不等式ATSP输入数据（不同p）
+    # 'npz_file': f'/data/jinmohan/NCOdata/atsp_1k_wo_ti/ATSP{problem_cnt}_wo_ti.npz', # 不满足三角不等式ATSP输入数据
+    # 'npz_file': f'/data/jinmohan/NCOdata/euc_tsp_1k/euc_TSP{problem_cnt}.npz', # 欧式TSP输入数据
     'test_batch_size': test_batch_size[problem_cnt],
     'augmentation_enable': False,
     'aug_factor': 128, # 每个问题重复推理 128 次
@@ -88,7 +102,9 @@ if tester_params['augmentation_enable']:
 
 logger_params = {
     'log_file': {
-        'filepath': f'result/test/sampled_symmetry/{problem_cnt}_{load_ckpt}_p100',
+        'filepath': f'result/test/sampled_symmetry/p{args.p}/{problem_cnt}/{problem_cnt}_{load_ckpt}_p{args.p}_k={args.k}',
+        # 'filepath': f'result/test/atsp_wo_ti/{problem_cnt}/{problem_cnt}_{load_ckpt}_k={args.k}',
+        # 'filepath': f'result/test/euc_tsp/{problem_cnt}/{problem_cnt}_{load_ckpt}_k={args.k}',
         'filename': 'log.txt'
     }
 }

@@ -13,13 +13,13 @@ def get_random_problems(batch_size, node_cnt, problem_gen_params, mix_tsp=False)
     problems = torch.randint(low=int_min, high=int_max, size=(batch_size, node_cnt, node_cnt))
 
     # If requested, mix data: first half ATSP, second half symmetric TSP from (D + D^T)/2
-    if mix_tsp:
-        # For odd batch_size we take floor(batch_size/2) for the front half
-        half = batch_size // 2
-        half = 0 # 全部
-        back = problems[half:]
-        back_sym = (back + back.transpose(1, 2)) // 2
-        problems[half:] = back_sym
+    # if mix_tsp:
+    #     # For odd batch_size we take floor(batch_size/2) for the front half
+    #     half = batch_size // 2
+    #     half = 0 # 全部
+    #     back = problems[half:]
+    #     back_sym = (back + back.transpose(1, 2)) // 2
+    #     problems[half:] = back_sym
 
     # shape: (batch, node, node)
     problems[:, torch.arange(node_cnt), torch.arange(node_cnt)] = 0

@@ -17,7 +17,7 @@ os.environ['PYTHONHASHSEED'] = '42'
 problems_size = 100
 head_num = 8
 embedding_dim = 256
-name = 'zeroInit_w_edgeValue_w_bias'
+name = 'sinkhorn_k_iter_20'
 qkv_dim = embedding_dim // head_num 
 
 ##########################################################################################
@@ -74,7 +74,7 @@ model_params = {
     'qkv_dim': qkv_dim,
     'sqrt_qkv_dim': qkv_dim**(1/2),
     'head_num': head_num,
-    'init': 'zero',
+    'init': 'svd',
     'att_type': 'normal',
     'logit_clipping': 10,
     'ff_hidden_dim': 512,

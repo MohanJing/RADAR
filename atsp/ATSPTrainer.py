@@ -76,7 +76,7 @@ class ATSPTrainer:
         
         wandb.init(
             project="RADAR",          # 在 wandb 上的项目名称，可自定义
-            name=f"sinkhorn_mix_full", # 运行的名称
+            name=f"sinkhorn_k_iter_-2", # 运行的名称
             config=wandb_config,          # 记录超参数
             resume="allow" if trainer_params['model_load']['enable'] else None # 支持断点续训
         )

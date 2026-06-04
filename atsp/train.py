@@ -15,7 +15,7 @@ os.environ['PYTHONHASHSEED'] = '42'
 problems_size = 100
 head_num = 8
 embedding_dim = 256
-name = 'ACTsinkhorn'
+name = 'sinkhorn_k_iter_-2'
 qkv_dim = embedding_dim // head_num 
 
 ##########################################################################################
@@ -37,8 +37,8 @@ print(sys.path)
 import logging
 
 from utils.utils import create_logger, copy_all_src
-# from ATSPTrainer import ATSPTrainer as Trainer
-from ACTTrainer import ATSPTrainer as Trainer
+from ATSPTrainer import ATSPTrainer as Trainer
+# from ACTTrainer import ATSPTrainer as Trainer
 
 def set_seed(seed=42):
     random.seed(seed)
