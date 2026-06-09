@@ -35,7 +35,7 @@ ckpt_path = f'result/train/{load_ckpt}'
 problem_cnt = args.node
 
 test_batch_size = {
-    100: 100,
+    100: 1000,
     200: 400,
     500: 50,
     1000: 3   

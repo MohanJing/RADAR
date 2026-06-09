@@ -2,37 +2,56 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 from ATSPModel_LIB import *
+from RLsinkhorn import StepController
 
 class ATSPModel(nn.Module):
     def __init__(self, **model_params):
         super().__init__()
         self.model_params = model_params
         self.embedding_dim = self.model_params['embedding_dim']
+        self.max_steps = self.model_params.get('max_steps', 20)
 
         self.encoder = ATSP_Encoder(**model_params)
         self.decoder = ATSP_Decoder(**model_params)
+        self.controller = StepController(self.embedding_dim, self.max_steps)
 
         self.k = 10
         self.projection = nn.Linear(2 * self.k, self.embedding_dim)
 
-        self.encoded_node = None  # shape: (batch, node, embedding)
+    def get_supernet_params(self):
+        # 返回除了 Controller 以外的所有参数
+        return [p for n, p in self.named_parameters() if 'controller' not in n]
 
-    def pre_forward(self, reset_state):
+    def get_controller_params(self):
+        return self.controller.parameters()
+
+    def pre_forward(self, reset_state, phase="supernet"):
+        """
+        两阶段训练的前向预处理。
+
+        Phase "supernet" (阶段一):
+          - 均匀随机采样 K ∈ [1, max_steps]
+          - 强制打破表征耦合，让 Encoder-Decoder 学会在各种迭代步数下都能工作
+          - K 不参与梯度计算 (detached)
+
+        Phase "controller" (阶段二):
+          - 利用 StepController 根据图特征预测最优 K
+          - 通过 RL 训练 Controller：奖励 = 解质量 - ponder_cost
+          - K 的 log_prob 和 entropy 被保存用于 RL loss
+        """
         problems = reset_state.problems
+        batch_size = problems.size(0)
+        
+        # ... (保留原有的 SVD 或 TopK 初始化逻辑) ...
         init_method = self.model_params.get('init', 'svd')
         
         mean_val = problems.mean(dim=(1, 2), keepdim=True)
         std_val = problems.std(dim=(1, 2), keepdim=True)
-        problems = (problems - mean_val) / (std_val + 1e-9)
+        norm_problems = (problems - mean_val) / (std_val + 1e-9)
         
-        if init_method == 'zero':
-            batch_size, n, _ = problems.shape
-            X = torch.zeros(batch_size, n, 2*self.k, device=problems.device, dtype=problems.dtype)
-            final_embedding = torch.zeros(batch_size, n, self.embedding_dim, device=problems.device, dtype=problems.dtype)
-        elif init_method == 'svd':
-            U, S, V = torch.svd_lowrank(problems, q=self.k)
+        if init_method == 'svd':
+            U, S, V = torch.svd_lowrank(norm_problems, q=self.k)
             sqrt_S = torch.sqrt(S)  # (batch, k)
 
             Q = U * sqrt_S.unsqueeze(1)  # (batch, n, k)
@@ -42,14 +61,14 @@ class ATSPModel(nn.Module):
 
             final_embedding = self.projection(X)
         elif init_method == 'topk':
-            batch_size, n, _ = problems.shape
+            n = problems.size(1)
             k_eff = min(self.k, max(n - 1, 0))
 
             if n > 1:
                 diag_mask = torch.eye(n, device=problems.device, dtype=torch.bool).unsqueeze(0)
-                masked_problems = problems.masked_fill(diag_mask, float('inf'))
+                masked_problems = norm_problems.masked_fill(diag_mask, float('inf'))
             else:
-                masked_problems = problems
+                masked_problems = norm_problems
 
             if k_eff > 0:
                 out_topk = torch.topk(masked_problems, k=k_eff, dim=2, largest=False).values
@@ -68,14 +87,32 @@ class ATSPModel(nn.Module):
                 in_topk = torch.cat([in_topk, pad], dim=-1)
 
             X = torch.cat([out_topk, in_topk], dim=-1)  # (batch, n, 2*k)
-        else:
-            raise ValueError(f"Unknown init method: {init_method}")
 
-        # final_embedding = self.projection(X)
+            final_embedding = self.projection(X)
         
-        self.encoded_node = self.encoder(final_embedding, problems) # 混合得分注意力输入的距离是经过归一化之后的
-        self.decoder.set_kv(self.encoded_node)
+        # 1. 提取图全局特征给 Controller
+        graph_feat = final_embedding.mean(dim=1) # (batch, embedding_dim)
+        
+        # 2. 根据训练阶段决定 K 的来源
+        if phase == "supernet":
+            # 阶段一：强制均匀采样，打破表征耦合 (Detach 掉，不计算梯度)
+            K_samples = torch.randint(1, self.max_steps + 1, (batch_size,), device=problems.device)
+            self.K_log_prob = None
+            self.K_entropy = None
+        else:
+            # 阶段二：利用 Controller 进行策略采样
+            dist = self.controller(graph_feat)
+            K_samples_idx = dist.sample() # 返回 [0, max_steps-1]
+            K_samples = K_samples_idx + 1 # 偏移到 [1, max_steps]
+            
+            self.K_log_prob = dist.log_prob(K_samples_idx)
+            self.K_entropy = dist.entropy()
 
+        self.K_samples = K_samples # 保存用于计算 ponder_cost
+
+        # 3. 将 K_samples 传递给 Encoder (需向下传递直至 RLSinkhorn)
+        self.encoded_node = self.encoder(final_embedding, problems, K_samples)
+        self.decoder.set_kv(self.encoded_node)
 
     def forward(self, state):
 
@@ -141,16 +178,20 @@ class ATSP_Encoder(nn.Module):
         super().__init__()
         encoder_layer_num = model_params['encoder_layer_num']
         self.layers = nn.ModuleList([EncodingBlock(**model_params) for _ in range(encoder_layer_num)])
+        self.num_layers = encoder_layer_num
+        self.ponder_cost = 0.0  # 累计所有层的平均 Sinkhorn 迭代步数
 
-    def forward(self, node_emb, cost_mat):
+    def forward(self, node_emb, cost_mat, K_samples):
         # col_emb.shape: (batch, col_cnt, embedding)
         # row_emb.shape: (batch, row_cnt, embedding)
         # cost_mat.shape: (batch, row_cnt, col_cnt)
+        total_ponder_cost = 0.0
 
         for layer in self.layers:
-            node_emb = layer(node_emb, cost_mat)
-        
+            node_emb = layer(node_emb, cost_mat, K_samples)
+            total_ponder_cost += layer.ponder_cost  # 累积每层的计算时间成本
 
+        self.ponder_cost = total_ponder_cost
         return node_emb
 
 
@@ -179,7 +220,9 @@ class EncodingBlock(nn.Module):
 
         self.g_layer = nn.Linear(embedding_dim, embedding_dim) # 没有使用
 
-    def forward(self, node_emb, cost_mat):
+        self.ponder_cost = 0.0
+
+    def forward(self, node_emb, cost_mat, K_samples):
         # NOTE: row and col can be exchanged, if cost_mat.transpose(1,2) is used
         # input1.shape: (batch, row_cnt, embedding)
         # input2.shape: (batch, col_cnt, embedding)
@@ -192,11 +235,16 @@ class EncodingBlock(nn.Module):
         v = reshape_by_heads(self.Wv(node_emb), head_num=head_num)
         # kv shape: (batch, head_num, col_cnt, qkv_dim
         
-        out_concat = self.mixed_score_MHA(q, k, v, cost_mat)
+        out_concat = self.mixed_score_MHA(q, k, v, cost_mat, K_samples)
         # shape: (batch, row_cnt, head_num*qkv_dim)
 
         multi_head_out = self.multi_head_combine(out_concat)
         # shape: (batch, row_cnt, embedding)
+
+        # 思考成本：当前层的平均 Sinkhorn 迭代步数
+        # RL trainer 通过 ponder_lambda * K_samples 统一计算惩罚项；
+        # 此处记录每层成本用于监控和日志
+        self.ponder_cost = K_samples.float().mean().item()
 
         out1 = self.add_n_normalization_1(node_emb, multi_head_out)
         out2 = self.feed_forward(out1)

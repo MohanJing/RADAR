@@ -1,4 +1,5 @@
 from ACTsinkhorn import ACTSinkhorn
+from RLsinkhorn import RLSinkhorn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -70,10 +71,15 @@ class MixedScore_MultiHeadAttention(nn.Module):
         self.k_iter = model_params.get('k_iter', 20)
         # 初始化 ACT Sinkhorn，设定一个合理的最大允许单次操作上限，如 20 次操作 (=10个完整行列迭代)
         self.act_sinkhorn = ACTSinkhorn(max_steps=20, eps=1e-3)
+        # 初始化 RL Sinkhorn
+        self.rl_sinkhorn = RLSinkhorn(max_steps=20)
 
-    def forward(self, q, k, v, cost_mat):
+    def forward(self, q, k, v, cost_mat, K_samples=None):
         # q shape: (batch, head_num, row_cnt, qkv_dim)
         # kv shape: (batch, head_num, col_cnt, qkv_dim)
+        # K_samples: optional (batch,) long tensor, Sinkhorn step counts in [1, max_steps]
+        #   - RL two-stage mode (not None): instance-adaptive RLSinkhorn
+        #   - Original mode (None): ACTSinkhorn with learned halting (backward-compatible)
         batch_size = q.size(0)
         row_cnt = q.size(2)
         col_cnt = k.size(2)
@@ -127,9 +133,18 @@ class MixedScore_MultiHeadAttention(nn.Module):
         # =======================================================
 
         # weights = nn.Softmax(dim=3)(mixed_scores)
-        weights = self.act_sinkhorn(mixed_scores)
-        # weights = sinkhorn_normalization_k(mixed_scores, k_iter=self.k_iter) 
+        # [deprecated] weights = self.act_sinkhorn(mixed_scores)
+        # [deprecated] weights = self.rl_sinkhorn(mixed_scores, K_samples=torch.full((batch_size,), self.k_iter, dtype=torch.long, device=mixed_scores.device))
+        # weights = sinkhorn_normalization_k(mixed_scores, k_iter=self.k_iter)
         # weights = sinkhorn_normalization(mixed_scores)
+
+        # Conditional Sinkhorn dispatch:
+        #   K_samples is not None → RL adaptive mode (RLSinkhorn)
+        #   K_samples is None     → original ACT mode (ACTSinkhorn, backward-compatible)
+        if K_samples is not None:
+            weights = self.rl_sinkhorn(mixed_scores, K_samples)
+        else:
+            weights = self.act_sinkhorn(mixed_scores)
 
         # ========= 保存归一化之后的注意力权重 (Attention Weights) =========
         # self.last_attention_weights = weights.detach().cpu()
