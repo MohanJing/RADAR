@@ -15,7 +15,7 @@ os.environ['PYTHONHASHSEED'] = '42'
 problems_size = 100
 head_num = 8
 embedding_dim = 256
-name = 'rl_two_stage_adaptive_k'
+name = 'rl_two_stage_6feat'
 qkv_dim = embedding_dim // head_num 
 
 ##########################################################################################
@@ -80,7 +80,7 @@ model_params = {
     'ms_hidden_dim': 16,
     'ms_layer1_init': (3/3)**(1/2),
     'ms_layer2_init': (3/16)**(1/2),
-    'max_steps': 20,           # Controller 可预测的最大 Sinkhorn 迭代步数 K ∈ [1, max_steps]
+    'max_steps': 40,           # Controller 可预测的最大 Sinkhorn 迭代步数 K ∈ [1, max_steps]
     'eval_type': 'softma',
     'one_hot_seed_cnt': problems_size,  # must be >= node_cnt
 }
@@ -88,11 +88,11 @@ model_params = {
 optimizer_params = {
     # RLTrainer 内部创建两个独立优化器，此处记录实际使用的参数
     'supernet': {
-        'lr': 1e-4,           # Encoder-Decoder 学习率
+        'lr': 4*1e-4,           # Encoder-Decoder 学习率
         'weight_decay': 1e-6
     },
     'controller': {
-        'lr': 1e-3,           # StepController 学习率（更大以加速策略收敛）
+        'lr': 1e-4,           # StepController 学习率（更大以加速策略收敛）
         'weight_decay': 1e-6
     },
     'scheduler': {
@@ -110,8 +110,12 @@ trainer_params = {
     # 两阶段交替训练控制
     'supernet_epochs': 5,        # 每周期 Supernet 训练轮数
     'controller_epochs': 1,      # 每周期 Controller 训练轮数
-    'beta_entropy': 0.05,        # Controller 熵正则化系数（鼓励探索）
-    'ponder_lambda': 0.005,      # 迭代步数惩罚系数（越大越鼓励用小 K）
+    'beta_entropy': 0.01,        # Controller 熵正则化系数（鼓励探索）
+    'ponder_lambda': 0.000,      # 迭代步数惩罚系数（越大越鼓励用小 K）
+    # ε-greedy 衰减：supernet 阶段以 ε 概率均匀探索，(1-ε) 概率使用 Controller 利用
+    'eps_start': 1.0,            # 初始 ε（早期纯探索）
+    'eps_end': 0.05,             # 最终 ε（后期偏利用，保留 5% 探索维持鲁棒性）
+    'eps_decay_epochs': 2100,    # ε 线性衰减的 epoch 数（设为总 epoch 数即全程衰减）
     'logging': {
         'model_save_interval': 100,
         'img_save_interval': 200,
@@ -125,10 +129,17 @@ trainer_params = {
         },
     },
     'model_load': {
-        'enable': False,  # enable loading pre-trained model
-        'path': '',  # directory path of pre-trained model and log files saved.
-        'epoch': 800,  # epoch version of pre-trained model to laod.
-    }
+        'enable': False,  # enable loading full checkpoint (supernet + controller)
+        'path': '',       # directory path of pre-trained model and log files saved.
+        'epoch': 800,     # epoch version of pre-trained model to load.
+    },
+    # 单独加载 Supernet 预训练权重（不含 Controller），用于两阶段训练
+    'supernet_load': {
+        'enable': False,  # 设为 True 加载预训练 supernet
+        'path': '/data/jinmohan/RADAR/atsp/result/train/radar_official_checkpoint/checkpoint-2100.pt',       # .pt 文件完整路径
+    },
+    # 冻结 Supernet，只训练 Controller
+    'freeze_supernet': False,
 }
 
 logger_params = {

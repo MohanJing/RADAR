@@ -1,40 +1,62 @@
 import torch
 
-def get_random_problems(batch_size, node_cnt, problem_gen_params, mix_tsp=False):
+def get_random_problems(batch_size, node_cnt, problem_gen_params, mix_tsp=False, euc_data=False):
 
-    ################################
-    # "tmat" type
-    ################################
-
-    int_min = problem_gen_params['int_min']
-    int_max = problem_gen_params['int_max']
     scaler = problem_gen_params['scaler']
 
-    problems = torch.randint(low=int_min, high=int_max, size=(batch_size, node_cnt, node_cnt))
+    if euc_data:
+        ################################
+        # Euclidean TSP (symmetric)
+        ################################
 
-    # If requested, mix data: first half ATSP, second half symmetric TSP from (D + D^T)/2
-    # if mix_tsp:
-    #     # For odd batch_size we take floor(batch_size/2) for the front half
-    #     half = batch_size // 2
-    #     half = 0 # 全部
-    #     back = problems[half:]
-    #     back_sym = (back + back.transpose(1, 2)) // 2
-    #     problems[half:] = back_sym
+        # Generate random 2D coordinates in [0, 1] range
+        coords = torch.rand(size=(batch_size, node_cnt, 2))
+        # shape: (batch, node_cnt, 2)
 
-    # shape: (batch, node, node)
-    problems[:, torch.arange(node_cnt), torch.arange(node_cnt)] = 0
+        # Compute pairwise Euclidean distances
+        # problems[i,j] = ||coords[:,i] - coords[:,j]||_2
+        diff = coords[:, :, None, :] - coords[:, None, :, :]   # (batch, node_cnt, node_cnt, 2)
+        problems = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-12)  # (batch, node_cnt, node_cnt)
 
-    for k in range(node_cnt):
-        problems = torch.minimum(
-            problems, 
-            problems[:, :, k:k+1] + problems[:, k:k+1, :]
-        )
+        # Diagonals are already ~0, but set explicitly to 0 for cleanliness
+        problems[:, torch.arange(node_cnt), torch.arange(node_cnt)] = 0
 
-    # Scale
-    scaled_problems = problems.float() / scaler
+        return problems
+        # shape: (batch, node, node)
 
-    return scaled_problems
-    # shape: (batch, node, node)
+    else:
+        ################################
+        # "tmat" type (ATSP)
+        ################################
+
+        int_min = problem_gen_params['int_min']
+        int_max = problem_gen_params['int_max']
+
+        problems = torch.randint(low=int_min, high=int_max, size=(batch_size, node_cnt, node_cnt))
+
+        # If requested, mix data: first half ATSP, second half symmetric TSP from (D + D^T)/2
+        # if mix_tsp:
+        #     # For odd batch_size we take floor(batch_size/2) for the front half
+        #     half = batch_size // 2
+        #     half = 0 # 全部
+        #     back = problems[half:]
+        #     back_sym = (back + back.transpose(1, 2)) // 2
+        #     problems[half:] = back_sym
+
+        # shape: (batch, node, node)
+        problems[:, torch.arange(node_cnt), torch.arange(node_cnt)] = 0
+
+        for k in range(node_cnt):
+            problems = torch.minimum(
+                problems,
+                problems[:, :, k:k+1] + problems[:, k:k+1, :]
+            )
+
+        # Scale
+        scaled_problems = problems.float() / scaler
+
+        return scaled_problems
+        # shape: (batch, node, node)
 
 def get_random_problems_orig(batch_size, node_cnt, problem_gen_params):
 

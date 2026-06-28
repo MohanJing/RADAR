@@ -5,6 +5,24 @@ import torch.nn.functional as F
 from ATSPModel_LIB import *
 from RLsinkhorn import StepController
 
+
+def _idx_to_K(idx, max_steps):
+    """将类别索引 [0, 2*max_steps-1] 映射为 K ∈ [-max_steps, -1] ∪ [1, max_steps]
+
+    Args:
+        idx: (batch,) LongTensor, category indices in [0, 2*max_steps-1]
+        max_steps: int, maximum absolute K value
+
+    Returns:
+        K: (batch,) LongTensor, signed K values
+    """
+    return torch.where(
+        idx < max_steps,
+        idx - max_steps,       # 负: [-max_steps, -1]
+        idx - max_steps + 1    # 正: [1, max_steps]
+    )
+
+
 class ATSPModel(nn.Module):
     def __init__(self, **model_params):
         super().__init__()
@@ -14,10 +32,15 @@ class ATSPModel(nn.Module):
 
         self.encoder = ATSP_Encoder(**model_params)
         self.decoder = ATSP_Decoder(**model_params)
-        self.controller = StepController(self.embedding_dim, self.max_steps)
+        # extra_dim=5: 本层原始得分统计量(4) + 层数特征(1)
+        # [旧] 原始特征: layer_feat(embedding_dim) + raw_stats(4) + layer_idx(1) = emb+5
+        # self.controller = StepController(self.embedding_dim, self.max_steps, extra_dim=5)
+        # [新] 特征: frob_err(1) + raw_stats(4) + layer_idx(1) = 6
+        self.controller = StepController(0, self.max_steps, extra_dim=6)
 
         self.k = 10
         self.projection = nn.Linear(2 * self.k, self.embedding_dim)
+        self.test = self.model_params.get('test', False)
 
     def get_supernet_params(self):
         # 返回除了 Controller 以外的所有参数
@@ -25,14 +48,6 @@ class ATSPModel(nn.Module):
 
     def get_controller_params(self):
         return self.controller.parameters()
-
-    def _idx_to_K(self, idx):
-        """将类别索引 [0, 2*max_steps-1] 映射为 K ∈ [-max_steps, -1] ∪ [1, max_steps]"""
-        return torch.where(
-            idx < self.max_steps,
-            idx - self.max_steps,       # 负: [-max_steps, -1]
-            idx - self.max_steps + 1    # 正: [1, max_steps]
-        )
 
     def pre_forward(self, reset_state, phase="supernet", forced_K_samples=None):
         # Encoder阶段
@@ -54,7 +69,12 @@ class ATSPModel(nn.Module):
         """
         problems = reset_state.problems
         batch_size = problems.size(0)
-        
+
+        # 原始数据的相对 Frobenius 误差: ||D - D^T||_F / ||D||_F（归一化之前计算）
+        raw_fro_norm = torch.sum(problems ** 2, dim=(1, 2))       # (batch,)
+        raw_asym_norm = torch.sum((problems - problems.transpose(1, 2)) ** 2, dim=(1, 2))  # (batch,)
+        frob_err = torch.sqrt(raw_asym_norm / (raw_fro_norm + 1e-8)).unsqueeze(1)  # (batch, 1)
+
         # ... (保留原有的 SVD 或 TopK 初始化逻辑) ...
         init_method = self.model_params.get('init', 'svd')
         
@@ -102,42 +122,30 @@ class ATSPModel(nn.Module):
 
             final_embedding = self.projection(X)
         
-        # 1. 提取图全局特征给 Controller, 是embedding的图特征，而不是encoder之后的图特征
-        graph_feat = final_embedding.mean(dim=1) # (batch, embedding_dim)
+        # 将归一化后的 cost_mat 传递给 Encoder
+        # Encoder 内部按层独立决定 K：
+        #   supernet:   ε-greedy（ε 均匀探索 + (1-ε) Controller 利用）
+        #   controller: 每层由 Controller 根据当前层输入隐向量特征预测不同的 K
+        #   forced_K_samples: 所有层使用相同的强制 K 值
+        eps = getattr(self, 'eps', 1.0)  # trainer 在每 epoch 开始时设置
+        if self.test:
+            eps = 0.0  # 测试阶段完全利用 Controller 预测的 K
 
-        # 2. 根据训练阶段决定 K 的来源
-        #    K ∈ [-max_steps, -1] ∪ [1, max_steps]  (2*max_steps categories)
-        #    idx → K 映射: idx < max_steps → K = idx - max_steps (负),
-        #                 idx ≥ max_steps → K = idx - max_steps + 1 (正)
-        num_categories = 2 * self.max_steps  # K 的范围，不含 0
+        self.encoded_node = self.encoder(final_embedding, problems,
+                                          controller=self.controller,
+                                          phase=phase,
+                                          forced_K_samples=forced_K_samples,
+                                          eps=eps, test=self.test,
+                                          frob_err=frob_err)
 
-        if forced_K_samples is not None:
-            # Shared baseline 模式：使用外部强制指定的 K 值，不经过 Controller
-            K_samples = forced_K_samples.to(device=problems.device)
-            self.dist = None  # 不使用 Controller，dist 置 None
-        elif phase == "supernet":
-            # 阶段一：强制均匀采样，打破表征耦合 (Detach 掉，不计算梯度)
-            K_samples_idx = torch.randint(0, num_categories, (batch_size,), device=problems.device)
-            K_samples = self._idx_to_K(K_samples_idx)
-            self.dist = None  # 不使用 Controller，dist 置 None
-        else:
-            # 阶段二：利用 Controller 进行策略采样
-            dist = self.controller(graph_feat)  # Categorical over 2*max_steps categories
-            self.dist = dist
-            K_samples_idx = dist.sample()       # 返回 [0, 2*max_steps-1]
-            K_samples = self._idx_to_K(K_samples_idx)
+        # 从 Encoder 获取逐层的 dist 和 K_samples
+        self.layer_dists = self.encoder.layer_dists           # list of Categorical | None
+        self.layer_K_samples = self.encoder.layer_K_samples   # list of (batch,) LongTensor
+        self.layer_K_samples_idx = self.encoder.layer_K_samples_idx
 
-        self.K_samples = K_samples # 保存用于计算 ponder_cost
-
-        # 3. 将归一化后的 cost_mat 和 K_samples 传递给 Encoder
-        #    注意：必须用 norm_problems（归一化后），否则 cost_mat 的尺度会淹没 attention score
-        #    Controller 阶段额外用 no_grad 包裹 encoder，因为 controller 梯度只需流到
-        #    graph_feat（encoder 之前），避免保存 encoder 5 层中间激活（~10GB）
-        if phase == "controller":
-            with torch.no_grad():
-                self.encoded_node = self.encoder(final_embedding, norm_problems, K_samples)
-        else:
-            self.encoded_node = self.encoder(final_embedding, norm_problems, K_samples)
+        # 保持向后兼容的接口
+        self.dist = self.layer_dists
+        self.K_samples = torch.stack(self.layer_K_samples, dim=0)  # (num_layers, batch)
         self.decoder.set_kv(self.encoded_node)
 
     def forward(self, state):
@@ -204,21 +212,111 @@ class ATSP_Encoder(nn.Module):
     def __init__(self, **model_params):
         super().__init__()
         encoder_layer_num = model_params['encoder_layer_num']
+        self.max_steps = model_params.get('max_steps', 20)
         self.layers = nn.ModuleList([EncodingBlock(**model_params) for _ in range(encoder_layer_num)])
         self.num_layers = encoder_layer_num
         self.ponder_cost = 0.0  # 累计所有层的平均 Sinkhorn 迭代步数
+        self.layer_dists = []       # 逐层 Categorical 分布（或 None）
+        self.layer_K_samples = []   # 逐层 K 值
+        self.layer_K_samples_idx = []
 
-    def forward(self, node_emb, cost_mat, K_samples):
-        # col_emb.shape: (batch, col_cnt, embedding)
-        # row_emb.shape: (batch, row_cnt, embedding)
-        # cost_mat.shape: (batch, row_cnt, col_cnt)
+    def forward(self, node_emb, cost_mat, controller=None, phase="supernet",
+                forced_K_samples=None, eps=1.0, test=False, frob_err=None):
+        """Encoder 前向传播，按层独立决定 K 值。
+
+        每层采用两阶段前向：
+          阶段一：计算本层原始混合得分矩阵并提取统计量（残差+方差）
+          阶段二：Controller 根据 [隐向量均值 | 原始得分统计量] 预测该层 K，
+                  然后执行 Sinkhorn 完成该层计算
+
+        Phase "supernet" — ε-greedy 混合采样:
+          - 以概率 ε：每层独立均匀随机 K（探索，维持鲁棒性）
+          - 以概率 1-ε：Controller 预测 K（利用，针对性微调）
+          - ε 随训练 epoch 从 1.0 线性衰减到 eps_end
+
+        Args:
+            node_emb: (batch, node_cnt, embedding_dim) 初始节点嵌入
+            cost_mat: (batch, node_cnt, node_cnt) 代价矩阵
+            controller: StepController 模块（controller 阶段使用）
+            phase: "supernet" | "controller"
+            forced_K_samples: 可选 (batch,) LongTensor，强制所有层使用相同 K
+            eps: float, ε-greedy 探索概率（仅 supernet 阶段有效）
+
+        Returns:
+            node_emb: (batch, node_cnt, embedding_dim) 编码后的节点嵌入
+        """
+        batch_size = node_emb.size(0)
+        num_categories = 2 * self.max_steps
         total_ponder_cost = 0.0
+        layer_dists = []
+        layer_K_samples = []
+        layer_K_samples_idx = []
 
-        for layer in self.layers:
-            node_emb = layer(node_emb, cost_mat, K_samples)
+        for layer_idx, layer in enumerate(self.layers):
+            # ===== 阶段一：计算本层原始得分矩阵的统计量（Sinkhorn 之前） =====
+            raw_stats = layer.prepare_scores(node_emb, cost_mat)  # (batch, 4)
+
+            # ===== 阶段二：决定本层的 K 值 =====
+            # [旧] 提取当前层输入隐向量的特征：所有节点隐向量的均值
+            # layer_feat = node_emb.mean(dim=1)  # (batch, embedding_dim)
+            # [新] 使用原始数据的相对 Frobenius 误差替代 layer_feat
+
+            if forced_K_samples is not None:
+                # Shared baseline 模式：所有层使用外部强制指定的 K 值
+                dist = None
+                K_samples = forced_K_samples.to(device=node_emb.device)
+                K_samples_idx = None
+            elif phase == "supernet":
+                # ε-greedy：每层独立，每个实例 ε 概率均匀探索，(1-ε) 概率 Controller 利用
+                # 始终计算 Controller 分布（用于 1-ε 部分）
+                layer_idx_feat = torch.full((batch_size, 1),
+                                            (layer_idx + 1) / self.num_layers,
+                                            device=node_emb.device)
+                # [旧] combined_feat = torch.cat([layer_feat, raw_stats, layer_idx_feat], dim=-1)
+                combined_feat = torch.cat([frob_err, raw_stats, layer_idx_feat], dim=-1)
+                with torch.no_grad():
+                    dist = controller(combined_feat)  # Categorical over 2*max_steps
+                    if test:
+                        controller_idx = dist.probs.argmax(dim=1)  # 测试阶段选择概率最高的 K
+                        # controller_idx = dist.sample()
+                    else:
+                        controller_idx = dist.sample()
+                    controller_K = _idx_to_K(controller_idx, self.max_steps)
+
+                # 均匀探索样本
+                uniform_idx = torch.randint(0, num_categories, (batch_size,), device=node_emb.device)
+                uniform_K = _idx_to_K(uniform_idx, self.max_steps)
+
+                # 每个实例独立决定：ε → uniform, 1-ε → controller
+                use_uniform = torch.rand(batch_size, device=node_emb.device) < eps
+                K_samples_idx = torch.where(use_uniform, uniform_idx, controller_idx)
+                K_samples = torch.where(use_uniform, uniform_K, controller_K)
+            else:
+                # 阶段二：Controller 根据 [隐向量均值 | 本层原始得分统计量 | 层数] 预测该层 K
+                # 层数特征: 从 1 开始归一化到 (0, 1]
+                layer_idx_feat = torch.full((batch_size, 1),
+                                            (layer_idx + 1) / self.num_layers,
+                                            device=node_emb.device)
+                # [旧] combined_feat = torch.cat([layer_feat, raw_stats, layer_idx_feat], dim=-1)
+                combined_feat = torch.cat([frob_err, raw_stats, layer_idx_feat], dim=-1)
+                # shape: (batch, 6)
+                dist = controller(combined_feat)  # Categorical over 2*max_steps categories
+                K_samples_idx = dist.sample()
+                K_samples = _idx_to_K(K_samples_idx, self.max_steps)
+
+            layer_dists.append(dist)
+            layer_K_samples.append(K_samples)
+            layer_K_samples_idx.append(K_samples_idx)
+
+            # ===== 阶段三：用预测的 K 执行 Sinkhorn 并完成该层计算 =====
+            node_emb = layer.execute_with_K(K_samples)
             total_ponder_cost += layer.ponder_cost  # 累积每层的计算时间成本
 
         self.ponder_cost = total_ponder_cost
+        self.layer_K_samples_idx = layer_K_samples_idx
+        self.layer_dists = layer_dists
+        self.layer_K_samples = layer_K_samples
+
         return node_emb
 
 
@@ -248,29 +346,62 @@ class EncodingBlock(nn.Module):
         self.g_layer = nn.Linear(embedding_dim, embedding_dim) # 没有使用
 
         self.ponder_cost = 0.0
+        self.sinkhorn_stats = None  # 本层 Sinkhorn 得分矩阵统计量 (batch, 4)
+        self.raw_score_stats = None # 本层原始得分矩阵统计量 (batch, 4)，供 Controller 预测 K
 
-    def forward(self, node_emb, cost_mat, K_samples):
-        # NOTE: row and col can be exchanged, if cost_mat.transpose(1,2) is used
-        # input1.shape: (batch, row_cnt, embedding)
-        # input2.shape: (batch, col_cnt, embedding)
-        # cost_mat.shape: (batch, row_cnt, col_cnt)
+        # 两阶段前向的缓存
+        self._cached_node_emb = None
+        self._cached_mixed_scores = None
+        self._cached_v = None
+
+    def prepare_scores(self, node_emb, cost_mat):
+        """阶段一：计算 QKV 和原始混合得分矩阵，提取统计量供 Controller 预测 K。
+
+        在已知 K 之前调用。统计量基于 softmax 归一化的原始得分矩阵，
+        反映该层注意力得分的合法性（行和偏离1）和确定性（方差/集中度）。
+
+        Returns:
+            raw_score_stats: (batch, 4)  — [err_row, err_col, var_row, var_col]
+        """
         head_num = self.model_params['head_num']
 
         q = reshape_by_heads(self.Wq(node_emb), head_num=head_num)
-        # q shape: (batch, head_num, row_cnt, qkv_dim)
         k = reshape_by_heads(self.Wk(node_emb), head_num=head_num)
         v = reshape_by_heads(self.Wv(node_emb), head_num=head_num)
-        # kv shape: (batch, head_num, col_cnt, qkv_dim
-        
-        out_concat = self.mixed_score_MHA(q, k, v, cost_mat, K_samples)
+
+        mixed_scores = self.mixed_score_MHA.compute_raw_scores(q, k, cost_mat)
+        self.raw_score_stats = self.mixed_score_MHA.raw_score_stats
+
+        # 缓存中间结果供 execute_with_K 使用
+        self._cached_node_emb = node_emb
+        self._cached_mixed_scores = mixed_scores
+        self._cached_v = v
+
+        return self.raw_score_stats
+
+    def execute_with_K(self, K_samples):
+        """阶段二：使用 Controller 预测的 K 执行 Sinkhorn 并完成该层的剩余计算。
+
+        Args:
+            K_samples: (batch,) signed Sinkhorn step counts
+
+        Returns:
+            node_emb: (batch, row_cnt, embedding)
+        """
+        node_emb = self._cached_node_emb
+        mixed_scores = self._cached_mixed_scores
+        v = self._cached_v
+
+        out_concat = self.mixed_score_MHA.forward_with_scores(mixed_scores, v, K_samples)
         # shape: (batch, row_cnt, head_num*qkv_dim)
+
+        # 获取 Sinkhorn 收敛后的统计量（用于监控和下一层的额外特征）
+        self.sinkhorn_stats = self.mixed_score_MHA.sinkhorn_stats
 
         multi_head_out = self.multi_head_combine(out_concat)
         # shape: (batch, row_cnt, embedding)
 
-        # 思考成本：当前层的平均 Sinkhorn 迭代步数（与起始维无关，只取决于 |K|）
-        # RL trainer 通过 ponder_lambda * |K_samples| 统一计算惩罚项；
-        # 此处记录每层成本用于监控和日志
+        # 思考成本：当前层的平均 Sinkhorn 迭代步数
         self.ponder_cost = K_samples.abs().float().mean().item()
 
         out1 = self.add_n_normalization_1(node_emb, multi_head_out)
@@ -279,6 +410,11 @@ class EncodingBlock(nn.Module):
 
         return out3
         # shape: (batch, row_cnt, embedding)
+
+    def forward(self, node_emb, cost_mat, K_samples):
+        """完整的前向传播（向后兼容，用于不需要两阶段分离的场景）。"""
+        self.prepare_scores(node_emb, cost_mat)
+        return self.execute_with_K(K_samples)
 
 
 

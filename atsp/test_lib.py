@@ -1,3 +1,5 @@
+# 用于测试TSPLIB数据集的代码
+
 DEBUG_MODE = False
 USE_CUDA = not DEBUG_MODE
 CUDA_DEVICE_NUM = 0

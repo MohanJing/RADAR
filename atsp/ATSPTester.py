@@ -5,8 +5,11 @@ import numpy as np
 from logging import getLogger
 
 from ATSPEnv import ATSPEnv as Env
-# from ATSPModel import ATSPModel as Model
-from ACTmodel import ATSPModel as Model
+
+from ATSPModel import ATSPModel as Model
+# from ACTmodel import ATSPModel as Model
+# from RLmodel_layer import ATSPModel as Model
+
 from utils.utils import get_result_folder, AverageMeter, TimeEstimator
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -90,9 +93,9 @@ class ATSPTester:
         self.logger.info(f"NO-AUG SCORE: {score_AM.avg:.4f} ± {score_std_AM.avg:.4f}")
         self.logger.info(f"AUGMENTED SCORE: {aug_score_AM.avg:.4f} ± {aug_score_std_AM.avg:.4f}")
 
-        # save_dir = os.path.join(os.path.dirname(__file__), 'result/answer/sampled_symmetry')
+        # save_dir = os.path.join(os.path.dirname(__file__), f'result/answer/sampled_symmetry/p0/{node_cnt}')
         # os.makedirs(save_dir, exist_ok=True)
-        # save_path = os.path.join(save_dir, f"res_{self.tester_params['model_load']['path'].split('/')[-1]}_{self.env_params['node_cnt']}.npz")
+        # save_path = os.path.join(save_dir, f"{self.tester_params['model_load']['path'].split('/')[-1]}_k={self.model_params['k_iter']}.npz")
         # np.savez(save_path, tour=all_best_routes, cost=all_best_costs)
         # self.logger.info(f"Saved inference results to {save_path}")
 

@@ -70,16 +70,11 @@ class MixedScore_MultiHeadAttention(nn.Module):
 
         self.k_iter = model_params.get('k_iter', 20)
         # 初始化 ACT Sinkhorn，设定一个合理的最大允许单次操作上限，如 20 次操作 (=10个完整行列迭代)
-        self.act_sinkhorn = ACTSinkhorn(max_steps=20, eps=1e-3)
-        # 初始化 RL Sinkhorn
-        self.rl_sinkhorn = RLSinkhorn(max_steps=20)
+        # self.act_sinkhorn = ACTSinkhorn(max_steps=20, eps=1e-3)
 
-    def forward(self, q, k, v, cost_mat, K_samples=None):
+    def forward(self, q, k, v, cost_mat):
         # q shape: (batch, head_num, row_cnt, qkv_dim)
         # kv shape: (batch, head_num, col_cnt, qkv_dim)
-        # K_samples: optional (batch,) long tensor, Sinkhorn step counts in [1, max_steps]
-        #   - RL two-stage mode (not None): instance-adaptive RLSinkhorn
-        #   - Original mode (None): ACTSinkhorn with learned halting (backward-compatible)
         batch_size = q.size(0)
         row_cnt = q.size(2)
         col_cnt = k.size(2)
@@ -133,18 +128,9 @@ class MixedScore_MultiHeadAttention(nn.Module):
         # =======================================================
 
         # weights = nn.Softmax(dim=3)(mixed_scores)
-        # [deprecated] weights = self.act_sinkhorn(mixed_scores)
-        # [deprecated] weights = self.rl_sinkhorn(mixed_scores, K_samples=torch.full((batch_size,), self.k_iter, dtype=torch.long, device=mixed_scores.device))
-        # weights = sinkhorn_normalization_k(mixed_scores, k_iter=self.k_iter)
+        # weights = self.act_sinkhorn(mixed_scores)
+        weights = sinkhorn_normalization_k(mixed_scores, k_iter=self.k_iter) 
         # weights = sinkhorn_normalization(mixed_scores)
-
-        # Conditional Sinkhorn dispatch:
-        #   K_samples is not None → RL adaptive mode (RLSinkhorn)
-        #   K_samples is None     → original ACT mode (ACTSinkhorn, backward-compatible)
-        if K_samples is not None:
-            weights = self.rl_sinkhorn(mixed_scores, K_samples)
-        else:
-            weights = self.act_sinkhorn(mixed_scores)
 
         # ========= 保存归一化之后的注意力权重 (Attention Weights) =========
         # self.last_attention_weights = weights.detach().cpu()
@@ -162,7 +148,7 @@ class MixedScore_MultiHeadAttention(nn.Module):
         # shape: (batch, row_cnt, head_num*qkv_dim)
 
         return out_concat
-    
+
 
 def sinkhorn_normalization(scores, n_iter=10):
     scores = scores - scores.max(dim=-1, keepdim=True)[0]
@@ -188,3 +174,152 @@ def sinkhorn_normalization_k(scores, k_iter=20):
         scores = scores - scores.logsumexp(dim=current_dim, keepdim=True)
         
     return scores.exp()
+
+class MixedScore_MultiHeadAttention_dynamic(nn.Module):
+    def __init__(self, **model_params):
+        super().__init__()
+        self.model_params = model_params
+
+        head_num = model_params['head_num']
+        ms_hidden_dim = model_params['ms_hidden_dim']
+        mix1_init = model_params['ms_layer1_init']
+        mix2_init = model_params['ms_layer2_init']
+
+        mix1_weight = torch.torch.distributions.Uniform(low=-mix1_init, high=mix1_init).sample((head_num, 3, ms_hidden_dim))
+        mix1_bias = torch.torch.distributions.Uniform(low=-mix1_init, high=mix1_init).sample((head_num, ms_hidden_dim))
+        self.mix1_weight = nn.Parameter(mix1_weight)
+        # shape: (head, 3, ms_hidden)
+        self.mix1_bias = nn.Parameter(mix1_bias)
+        # shape: (head, ms_hidden)
+
+        mix2_weight = torch.torch.distributions.Uniform(low=-mix2_init, high=mix2_init).sample((head_num, ms_hidden_dim, 1))
+        mix2_bias = torch.torch.distributions.Uniform(low=-mix2_init, high=mix2_init).sample((head_num, 1))
+        self.mix2_weight = nn.Parameter(mix2_weight)
+        # shape: (head, ms_hidden, 1)
+        self.mix2_bias = nn.Parameter(mix2_bias)
+        # shape: (head, 1)
+
+        self.k_iter = model_params.get('k_iter', 20)
+        # 初始化 ACT Sinkhorn，设定一个合理的最大允许单次操作上限，如 20 次操作 (=10个完整行列迭代)
+        # self.act_sinkhorn = ACTSinkhorn(max_steps=20, eps=1e-3)
+        # 初始化 RL Sinkhorn
+        self.rl_sinkhorn = RLSinkhorn(max_steps=20)
+
+        # 得分矩阵统计量，供 Controller 作为逐层特征
+        self.raw_score_stats = None   # (batch, 4) 原始得分统计量（Sinkhorn 前，用于预测本层 K）
+        self.sinkhorn_stats = None    # (batch, 4) Sinkhorn 收敛后统计量（用于监控）
+
+    def _compute_mixed_scores(self, q, k, cost_mat):
+        """计算原始混合得分矩阵（共享逻辑）。
+
+        Returns:
+            mixed_scores: (batch, head_num, row_cnt, col_cnt)
+        """
+        batch_size = q.size(0)
+        row_cnt = q.size(2)
+        col_cnt = k.size(2)
+        head_num = self.model_params['head_num']
+        sqrt_qkv_dim = self.model_params['sqrt_qkv_dim']
+
+        dot_product = torch.matmul(q, k.transpose(2, 3))
+        dot_product_score = dot_product / sqrt_qkv_dim
+        cost_mat_score = cost_mat[:, None, :, :].expand(batch_size, head_num, row_cnt, col_cnt)
+
+        two_scores = torch.stack((dot_product_score, cost_mat_score, cost_mat_score.transpose(2, 3)), dim=4)
+        two_scores_transposed = two_scores.transpose(1, 2)
+
+        ms1 = torch.matmul(two_scores_transposed, self.mix1_weight)
+        ms1 = ms1 + self.mix1_bias[None, None, :, None, :]
+        ms1_activated = F.relu(ms1)
+
+        ms2 = torch.matmul(ms1_activated, self.mix2_weight)
+        ms2 = ms2 + self.mix2_bias[None, None, :, None, :]
+
+        mixed_scores = ms2.transpose(1, 2).squeeze(4)
+        return mixed_scores
+
+    def _compute_score_stats(self, S, batch_size, head_num):
+        """从原始得分矩阵 S 提取统计量，在 head 维度上取均值。
+        
+        注意：S 是未经过任何归一化的 Raw Logits。
+        
+        Args:
+            S: (batch, head_num, row_cnt, col_cnt) 原始混合得分矩阵
+        Returns:
+            stats: (batch, 4)  — [var_row, var_col, gap_row, gap_col] 均值
+        """
+        # 1. 集中度：使用 unbiased=False 计算原始得分的真实总体方差
+        var_row = S.var(dim=-1, unbiased=False, keepdim=True).mean(dim=-2, keepdim=True)
+        var_col = S.var(dim=-2, unbiased=False, keepdim=True).mean(dim=-1, keepdim=True)
+        
+        # 2. 支配力 (Max-Mean Gap)：最大值与均值的差，衡量绝对优势边的强度
+        gap_row = (S.max(dim=-1, keepdim=True)[0] - S.mean(dim=-1, keepdim=True)).mean(dim=-2, keepdim=True)
+        gap_col = (S.max(dim=-2, keepdim=True)[0] - S.mean(dim=-2, keepdim=True)).mean(dim=-1, keepdim=True)
+        
+        # 拼接 4 个统计量，在 head 维度上取均值 → (batch, 4)
+        stats = torch.cat([var_row, var_col, gap_row, gap_col], dim=1)  # (batch, 4*head, 1, 1)
+        stats = stats.squeeze(-1).squeeze(-1)                           # (batch, 4*head)
+        stats = stats.view(batch_size, head_num, 4).mean(dim=1)         # (batch, 4)
+        
+        return stats
+
+    def compute_raw_scores(self, q, k, cost_mat):
+        """阶段一：计算原始混合得分矩阵，并提取统计量供 Controller 预测 K。
+
+        在 Sinkhorn 归一化之前调用。统计量基于 softmax 归一化的伪概率矩阵，
+        反映原始得分的合法性（行和偏离1的程度）和确定性（方差/集中度）。
+
+        Returns:
+            mixed_scores: (batch, head_num, row_cnt, col_cnt)
+        Stores:
+            self.raw_score_stats: (batch, 4)
+        """
+        batch_size = q.size(0)
+        mixed_scores = self._compute_mixed_scores(q, k, cost_mat)
+
+        with torch.no_grad():
+            self.raw_score_stats = self._compute_score_stats(mixed_scores, batch_size, self.model_params['head_num'])
+
+        return mixed_scores
+
+    def forward_with_scores(self, mixed_scores, v, K_samples):
+        """阶段二：在给定 K 的情况下执行 Sinkhorn 归一化并计算注意力输出。
+
+        Args:
+            mixed_scores: (batch, head_num, row_cnt, col_cnt) 原始混合得分
+            v: (batch, head_num, col_cnt, qkv_dim)
+            K_samples: (batch,) signed Sinkhorn step counts
+
+        Returns:
+            out_concat: (batch, row_cnt, head_num * qkv_dim)
+        Stores:
+            self.sinkhorn_stats: (batch, 4) — Sinkhorn 收敛后的统计量
+        """
+        batch_size = mixed_scores.size(0)
+        row_cnt = mixed_scores.size(2)
+        head_num = self.model_params['head_num']
+        qkv_dim = self.model_params['qkv_dim']
+
+        if K_samples is not None:
+            weights = self.rl_sinkhorn(mixed_scores, K_samples)
+        else:
+            weights = sinkhorn_normalization_k(mixed_scores, k_iter=self.k_iter)
+
+        # 后 Sinkhorn 统计量（收敛质量）
+        with torch.no_grad():
+            self.sinkhorn_stats = self._compute_score_stats(weights, batch_size, head_num)
+
+        out = torch.matmul(weights, v)
+        out_transposed = out.transpose(1, 2)
+        out_concat = out_transposed.reshape(batch_size, row_cnt, head_num * qkv_dim)
+
+        return out_concat
+
+    def forward(self, q, k, v, cost_mat, K_samples=None):
+        """完整的前向传播（向后兼容）。
+
+        对于 per-layer dynamic K 场景，推荐先调用 compute_raw_scores 获取统计量，
+        再由 Controller 预测 K，然后调用 forward_with_scores。
+        """
+        mixed_scores = self.compute_raw_scores(q, k, cost_mat)
+        return self.forward_with_scores(mixed_scores, v, K_samples)

@@ -3,8 +3,7 @@ from logging import getLogger
 from ATSPEnv import ATSPEnv as Env, Reset_State
 import wandb
 from utils.utils import *
-# from RLmodel import ATSPModel
-from RLmodel_layer import ATSPModel
+from RLmodel import ATSPModel
 
 class RLTrainer:
     def __init__(self,
@@ -77,6 +76,9 @@ class RLTrainer:
         # utility
         self.time_estimator = TimeEstimator()
 
+        # EMA Baseline 初始化
+        self.ema_baseline = None
+        
         # 两阶段交替训练配置：从 trainer_params 读取，支持用户自定义
         self.supernet_epochs = self.trainer_params.get('supernet_epochs', 5)
         self.controller_epochs = self.trainer_params.get('controller_epochs', 1)
@@ -92,23 +94,20 @@ class RLTrainer:
         
         wandb.init(
             project="RADAR_two_stage",          # 在 wandb 上的项目名称
-            name=f"two_stage_6feat", # 运行的名称
+            name=f"RL_two_stage", # 运行的名称
             config=wandb_config,          # 记录超参数
         )
 
     def run(self):
-        # ε-greedy 衰减参数
-        eps_start  = self.trainer_params.get('eps_start', 1.0)
-        eps_end    = self.trainer_params.get('eps_end', 0.05)
-        eps_decay  = self.trainer_params.get('eps_decay_epochs', self.trainer_params['epochs'])
-        total_epochs = self.trainer_params['epochs']
-
-        for epoch in range(1, total_epochs + 1):
+        for epoch in range(1, self.trainer_params['epochs']+1):
 
             # 确定当前 Epoch 处于哪个训练阶段
             if self.freeze_supernet:
+                # Supernet 冻结时全程训练 Controller
                 phase = "controller"
             else:
+                # 两阶段交替：supernet_epochs 个 epoch 训练 Supernet，
+                #              controller_epochs 个 epoch 训练 Controller
                 cycle = self.supernet_epochs + self.controller_epochs
                 rem = epoch % cycle
                 if rem == 0:
@@ -117,13 +116,8 @@ class RLTrainer:
                     phase = "supernet"
                 else:
                     phase = "controller"
-
-            # 计算当前 ε（线性衰减），设置到 model 供 supernet 阶段 ε-greedy 使用
-            progress = min(1.0, epoch / max(1, eps_decay))
-            epsilon = eps_end + (eps_start - eps_end) * (1.0 - progress)
-            self.model.eps = epsilon
-
-            self.logger.info(f'--- Epoch {epoch}/{total_epochs} | Phase: {phase.upper()} | ε: {epsilon:.3f} ---')
+                
+            self.logger.info(f'--- Epoch {epoch} | Phase: {phase.upper()} ---')
 
             # Train
             train_score, train_loss, avg_K = self._train_one_epoch(epoch, phase)
@@ -135,6 +129,7 @@ class RLTrainer:
                 "train_score": train_score,
                 f"{phase}_loss": train_loss,
                 "avg_step_K": avg_K,
+                "ema_baseline": self.ema_baseline if self.ema_baseline else 0.0
             }, step=epoch)
 
             ############################
@@ -209,6 +204,7 @@ class RLTrainer:
         state, reward, done = self.env.pre_step()
 
         if phase == "supernet":
+            # 必须调用 pre_forward 触发随机 K 采样
             self.model.pre_forward(reset_state, phase=phase)
             prob_list = torch.zeros(size=(batch_size, self.env.pomo_size, 0), device=self.model.decoder.Wk.weight.device)
             while not done:
@@ -232,107 +228,129 @@ class RLTrainer:
             return score_mean.item(), loss_supernet.item(), self.model.K_samples.abs().float().mean().item()
 
         elif phase == "controller":
-            if not self.freeze_supernet:
-                for param in self.model.get_supernet_params():
-                    param.requires_grad = False
+            # 阶段二：利用 Shared Baseline 更新 Controller
+            # 【修复1】：必须先执行 controller 的前向，使其根据图特征采样出 K_samples 和对应的 log_prob
+            self.model.pre_forward(reset_state, phase=phase)
 
-            # ==========================================
-            # 1. 构建多样本并行 Batch (Multi-Sample Batching)
-            # ==========================================
-            # M 为采样数量，建议设为 8。
-            # 如果原 batch_size=64，则扩充后并行量为 512，刚好打满 3090 且不 OOM。
-            M_samples = 16
+            # 安全检查：确保 Controller 已经正确采样了 K
+            if self.model.dist is None :
+                raise RuntimeError(
+                    "Make sure pre_forward was called with phase='controller'."
+                )
+
+            # 必须在进入 Baseline 循环前，将 Controller 输出的计算图和数据缓存！
+            # 避免被 _compute_shared_baseline 中的 forced_K 前向操作污染。
+            dist = self.model.dist
+            probs_all_K = dist.probs          # shape: (batch, num_K)
+            log_probs_all_K = dist.logits     # shape: (batch, num_K)
+
+            # 【获取正确的 Entropy】
+            entropy = dist.entropy()          # shape: (batch,)
             
-            # 将图问题复制 M 份。
-            # 形状变化: (batch, N, N) -> (M * batch, N, N)
-            # 结构: [G1, G2..Gn, G1, G2..Gn, ...] 重复 M 次
-            expanded_problems = reset_state.problems.repeat(M_samples, 1, 1)
-            eval_rs = Reset_State(problems=expanded_problems)
+            # 【缓存真实的采样 K 用于最终的日志记录】
+            sampled_K = self.model.K_samples  # shape: (batch,)
 
-            # ==========================================
-            # 2. Controller 批量并行采样
-            # ==========================================
-            # Controller 会为这 M*batch 个图独立进行概率采样。
-            # 对于同一个图的 M 个副本，采样出的异构 K 序列绝大多数是不同的。
-            self.model.pre_forward(eval_rs, phase=phase)
+            # --- Shared Baseline 计算 ---
+            # 对每个可能的 K 值评估 reward，得到 (batch, 2*max_steps) 的 per-K reward，
+            # 然后求平均作为实例相关的 baseline（类似 POMO 的 shared baseline 思想）
+            all_rewards, shared_baseline = self._compute_shared_baseline(batch_size, reset_state)
 
-            if not self.model.layer_dists or self.model.layer_dists[0] is None:
-                raise RuntimeError("Make sure pre_forward was called with phase='controller'.")
-
-            # ==========================================
-            # 3. Decoder 批量评估获取 Reward
-            # ==========================================
-            self.env.load_problems_manual(expanded_problems)
-            state, reward, done = self.env.reset()
-            state, reward, done = self.env.pre_step()
+            # 【修复2：构建全空间的 Ponder 惩罚】
+            max_steps = self.model.max_steps
+            all_K = torch.cat([
+                torch.arange(-max_steps, 0),
+                torch.arange(1, max_steps + 1)
+            ]).to(device=all_rewards.device)
             
-            with torch.no_grad():
-                while not done:
-                    selected, prob = self.model(state)
-                    state, reward, done = self.env.step(selected)
-
-            # 获取每条异构序列的最优分数 (POMO Max)
-            # actual_reward 形状: (M * batch,)
-            actual_reward, _ = reward.max(dim=1)  
-
-            # ==========================================
-            # 4. 计算异构序列的 Shared Baseline
-            # ==========================================
-            # 将一维张量重塑为 (M, batch) 以便按列（即按相同的图）进行统计
-            reshaped_reward = actual_reward.view(M_samples, batch_size)
+            all_K_abs = all_K.abs().float() # shape: (num_K,)
             
-            # 针对每个图，将其 M 个异构序列的 Reward 取平均，作为无偏 Baseline
-            # shared_baseline 形状: (batch,)
-            shared_baseline = reshaped_reward.mean(dim=0)
+            # Advantage = 真实 reward - 基线 - 对每一个 K 分别的惩罚
+            # all_K_abs.unsqueeze(0) 会广播为 (batch, num_K)
+            adv_all_K = (all_rewards - shared_baseline) - self.ponder_lambda * all_K_abs.unsqueeze(0)
 
-            # ==========================================
-            # 5. 提取逐层数据并计算对数概率与熵
-            # ==========================================
-            dists = self.model.layer_dists                  # list of Categorical, len=L
-            K_idxs = self.model.layer_K_samples_idx         # list of (M * batch,), len=L
-            K_vals = self.model.layer_K_samples             # list of (M * batch,), len=L
+            # 4. 计算解析策略梯度 Loss
+            loss_controller = - (adv_all_K.detach() * probs_all_K.detach() * log_probs_all_K).sum(dim=1).mean() \
+                              - self.beta_entropy * entropy.mean()
 
-            device = actual_reward.device
-            joint_log_prob = torch.zeros(M_samples * batch_size, device=device)
-            joint_entropy = torch.zeros(M_samples * batch_size, device=device)
-            total_ponder_abs = torch.zeros(M_samples * batch_size, device=device)
-
-            for l_dist, l_idx, l_val in zip(dists, K_idxs, K_vals):
-                joint_log_prob += l_dist.log_prob(l_idx)
-                joint_entropy += l_dist.entropy()
-                total_ponder_abs += l_val.abs().float()
-
-            # ==========================================
-            # 6. 计算 Advantage 与 Loss (全样本利用)
-            # ==========================================
-            # 将惩罚也重塑为 (M, batch) 以对齐形状
-            reshaped_ponder = total_ponder_abs.view(M_samples, batch_size)
-            
-            # Advantage = 真实 Reward - Baseline - 思考惩罚
-            # shared_baseline.unsqueeze(0) 会广播到 (M, batch)
-            adv_matrix = reshaped_reward - shared_baseline.unsqueeze(0) - self.ponder_lambda * reshaped_ponder
-            
-            # 展平回 (M * batch,) 用于 Loss 计算
-            adv_flat = adv_matrix.view(-1)
-
-            # 计算最终的 REINFORCE Loss
-            loss_controller = - (adv_flat.detach() * joint_log_prob).mean() \
-                              - self.beta_entropy * joint_entropy.mean()
-
-            # ==========================================
-            # 7. 梯度更新与日志
-            # ==========================================
             self.controller_optim.zero_grad()
             loss_controller.backward()
             torch.nn.utils.clip_grad_norm_(self.model.get_controller_params(), 1.0)
             self.controller_optim.step()
 
-            if not self.freeze_supernet:
-                for param in self.model.get_supernet_params():
-                    param.requires_grad = True
-                    
-            # 记录当前 batch 的平均最优分数
-            score_mean = -reshaped_reward.max(dim=0)[0].mean().item() 
-            avg_K_per_layer = total_ponder_abs.mean().item() / self.model.encoder.num_layers
+            max_K_reward, _ = all_rewards.max(dim=1) # shape: (batch,) 选择所有K中最好的那个
+            score_mean = -max_K_reward.float().mean()
 
-            return score_mean, loss_controller.item(), avg_K_per_layer
+            # 使用一开始缓存的 sampled_K 来反映 Controller 真实的采样偏好
+            return score_mean.item(), loss_controller.item(), sampled_K.abs().float().mean().item()
+
+    def _compute_shared_baseline(self, batch_size, reset_state):
+        """
+        POMO-style shared baseline for Controller RL.
+
+        对每个 K ∈ [-max_steps, -1] ∪ [1, max_steps] 评估 reward，
+        取 max over pomo → average over K，得到实例相关的 baseline (batch,)。
+
+        """
+        max_steps = self.model.max_steps
+        saved_problems = reset_state.problems.clone()
+        device = saved_problems.device
+
+        # 生成所有 K 值列表：[-max_steps, ..., -1, 1, ..., max_steps]
+        all_K = torch.cat([
+            torch.arange(-max_steps, 0),
+            torch.arange(1, max_steps + 1)
+        ])  # (2*max_steps,)
+        num_K = len(all_K)
+
+        all_rewards = torch.zeros(batch_size, num_K, device=device)  # (batch, 2*max_steps)
+
+        # 【核心参数】：并行分组大小。
+        # 取值范围 1 到 num_K。
+        # 如果设为 1，等价于纯串行；如果设为 num_K，则是全量并行。
+        # 建议先设定为 8 观察显存（3090 24G 预计能承受 8-16 的并行度）。
+        chunk_size = 16  
+
+        with torch.no_grad():
+            for i in range(0, num_K, chunk_size):
+                # 提取当前并行块对应的 K 值
+                chunk_K = all_K[i : i + chunk_size]
+                current_chunk = len(chunk_K)
+
+                # 1. 复制图特征：将 problems 沿着 batch 维度复制 current_chunk 份
+                # 形状变为: (current_chunk * batch_size, node, node)
+                expanded_problems = saved_problems.repeat(current_chunk, 1, 1)
+
+                # 2. 对齐 K 值掩码
+                # chunk_K 形状: (current_chunk,) 
+                # 变换后 forced_K 形状: (current_chunk * batch_size,)
+                # 结构为: [K0, K0..., K1, K1..., K2, K2...] (每个 K 连续 batch_size 次)
+                forced_K = chunk_K.unsqueeze(1).expand(current_chunk, batch_size).reshape(-1)
+
+                # 3. 前向计算（利用扩充后的并行 Batch）
+                eval_rs = Reset_State(problems=expanded_problems)
+                self.model.pre_forward(eval_rs, forced_K_samples=forced_K)
+
+                self.env.load_problems_manual(expanded_problems)
+                state, reward, done = self.env.reset()
+                state, reward, done = self.env.pre_step()
+                
+                while not done:
+                    selected, prob = self.model(state)
+                    state, reward, done = self.env.step(selected)
+
+                # 4. 提取当前块的结果
+                max_r, _ = reward.max(dim=1)  # shape: (current_chunk * batch_size,)
+                
+                # 5. 结果重排与赋值
+                # 先转化为 (current_chunk, batch_size)，然后转置回 (batch_size, current_chunk)
+                chunk_rewards = max_r.view(current_chunk, batch_size).transpose(0, 1)
+                
+                # 写入最终的 Reward 矩阵中
+                all_rewards[:, i : i + current_chunk] = chunk_rewards
+
+        # 对每个 K，取 pomo 中的最大值（已在上面的 max 中完成）
+        # all_rewards: (batch, 2*max_steps)
+        # Shared baseline = mean over K
+        shared_baseline = all_rewards.mean(dim=1, keepdim=True)  # (batch, 1)
+
+        return all_rewards, shared_baseline

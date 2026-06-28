@@ -61,7 +61,9 @@ class ATSPEnv:
         self.POMO_IDX = torch.arange(self.pomo_size)[None, :].expand(self.batch_size, self.pomo_size)
 
         problem_gen_params = self.env_params['problem_gen_params']
-        self.problems = get_random_problems(batch_size, self.node_cnt, problem_gen_params, mix_tsp= self.env_params['mix_tsp'])
+        euc_data = self.env_params.get('euc_data', False)
+        mix_tsp = self.env_params.get('mix_tsp', False)
+        self.problems = get_random_problems(batch_size, self.node_cnt, problem_gen_params, mix_tsp= mix_tsp, euc_data=euc_data)
         # shape: (batch, node, node)
 
     def load_problems_manual(self, problems):

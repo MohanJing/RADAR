@@ -34,9 +34,10 @@ ckpt_path = f'result/train/{load_ckpt}'
 # problem_cnt = 1000
 problem_cnt = args.node
 
+# 对于supernet+controller, n = 200时batch_size = 200才不爆显存。原始是200: 400
 test_batch_size = {
     100: 1000,
-    200: 400,
+    200: 200,
     500: 50,
     1000: 3   
 }
@@ -77,7 +78,9 @@ model_params = {
     'ms_layer2_init': (1/16)**(1/2),
     'eval_type': 'softmax',
     'one_hot_seed_cnt': problem_cnt,  # must be >= node_cnt
-    'k_iter': args.k,
+    # 'k_iter': args.k,
+    # 'max_steps': 40,
+    'test': True,  # 在模型前向传播中启用测试模式（使用 Controller 预测的 K，且不进行 ε-greedy 探索）
 }
 
 tester_params = {

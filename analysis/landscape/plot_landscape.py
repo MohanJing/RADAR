@@ -13,13 +13,17 @@ def calculate_tour_length(tour, dist_matrix):
         length += dist_matrix[tour[i], tour[(i+1) % num_nodes]]
     return length
 
-def two_opt_swap(tour):
-    """Perform a random 2-opt swap on the tour."""
-    new_tour = tour.copy()
+def insert_move(tour):
+    """Perform a random insert move: remove a node and insert it at another position.
+    Unlike 2-opt, this does not reverse any edges — suitable for asymmetric TSP."""
+    new_tour = list(tour)
     num_nodes = len(tour)
-    i, j = sorted(random.sample(range(num_nodes), 2))
-    new_tour[i:j+1] = list(reversed(new_tour[i:j+1]))
-    return new_tour
+    i, j = random.sample(range(num_nodes), 2)
+    # Remove node at position i
+    node = new_tour.pop(i)
+    # Insert it at position j (index j in the list after removal)
+    new_tour.insert(j, node)
+    return np.array(new_tour)
 
 def get_edges(tour):
     """Get a set of undirected edges from a tour."""
@@ -43,7 +47,7 @@ def main():
     random.seed(seed)
     np.random.seed(seed)
 
-    node_cnt = 1000
+    node_cnt = 100
 
     print("Loading data...")
     # 1. Load Data
@@ -66,7 +70,7 @@ def main():
     print(f"Optimal tour length (LKH): {opt_cost:.4f}")
 
     # 2. Sample Solution Space
-    print("Sampling solution space via 2-opt perturbations...")
+    print("Sampling solution space via insert perturbations...")
     samples = []
     fitness = []
     
@@ -81,7 +85,7 @@ def main():
     for _ in range(num_random_walks):
         curr_tour = opt_tour.copy()
         for step in range(steps_per_walk):
-            curr_tour = two_opt_swap(curr_tour)
+            curr_tour = insert_move(curr_tour)
             samples.append(curr_tour)
             fitness.append(calculate_tour_length(curr_tour, dist_matrix))
             
